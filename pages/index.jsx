@@ -74,17 +74,31 @@ function detectAlerts(quotes) {
 
 const EXTRACTION_PROMPT = `Extract mortgage fees into JSON. Numbers only, no $ or commas. "" if not found. Return ONLY JSON:
 {"lenderName":"","loanOfficer":"","loanAmount":"","rate":"","term":30,"purchasePrice":"","cashToClose":"","sellerCredit":"","lenderCredit":"","unknownCredit":"","earnestMoney":"","processingFee":"","underwritingFee":"","adminFee":"","docPrepFee":"","loanOriginationFee":"","techBundleFee":"","otherLenderFees":"","discountPoints":"","originationFeePoints":"","appraisalFee":"","creditReport":"","closingFee":"","closingCoordFee":"","ownersTitleIns":"","lendersTitleIns":"","titleServices":"","otherThirdParty":"","homeownersInsAnnual":"","homeownersInsEscrow":"","propertyTaxEscrow":"","prepaidInterest":"","mortgageInsurance":"","otherEscrows":""}
-RULES:
-- Processing→processingFee, Underwriting→underwritingFee, Admin→adminFee (LENDER FEES)
-- Discount Points→discountPoints, Origination Fee/1%→loanOriginationFee (POINTS)
-- Tech Bundle→techBundleFee, VOE→otherLenderFees (THIRD PARTY)
-- Rate: number only e.g. "5.125"
-CRITICAL CREDIT RULES:
-- "Seller Credit" or "Seller Paid" or "Seller Contribution"→sellerCredit (from seller, excluded from lender comparison)
-- "Lender Credit" or "Lender Paid Costs"→lenderCredit (from lender, reduces lender costs)
-- "Earnest Money" or "Earnest Money Deposit"→earnestMoney (buyer's deposit, not a lender cost)
-- Any other credit/adjustment where the source is unclear→unknownCredit (we will flag this for review)
-- If a credit just says "Credit" or "Adjustment" without specifying seller or lender, put it in unknownCredit`;
+
+CRITICAL CLASSIFICATION RULES:
+LENDER FEES (Bucket 1):
+- "Processing Fee"/"Processing"→processingFee
+- "Underwriting Fee"/"UW Fee"→underwritingFee
+- "Admin Fee"/"Doc Prep Fee"→adminFee
+
+POINTS & ORIGINATION (Bucket 4) — these are costs the BORROWER pays to buy down the rate:
+- "Loan Discount" or "Loan Discount/Credits/Adjustments" or "Discount Points"→discountPoints. THIS IS NOT A CREDIT — it is the borrower paying points to reduce the rate. The word "discount" here means rate discount, NOT a credit.
+- "Loan Origination" or "Loan Origination 1.000%"→loanOriginationFee. A 1% origination = 1 point.
+
+THIRD PARTY (Bucket 2):
+- "Tech Bundle"/"Technology Fee"→techBundleFee
+- "VOE"/"Tax Monitoring Service Fee"/"Verification of Employment"→otherLenderFees
+- "Flood Certification"/"Final Inspection"/"Title Examination"/"Abstracting"/"Doc Prep" (when listed under third party)→sum into otherThirdParty
+
+CREDITS — VERY IMPORTANT DISTINCTIONS:
+- "Seller Credit"/"Seller Paid"/"Closing Costs paid by Seller"→sellerCredit
+- "Other Credits" in the summary section (line l)→sellerCredit (this is almost always seller-paid closing cost assistance)
+- "Lender Credit"/"Lender Paid"→lenderCredit (only if explicitly labeled as FROM the lender)
+- "Loan Credit 1"/"Loan Credit 2" with $0 values→ignore these
+- "Earnest Money"/"Earnest Money Deposit"→earnestMoney
+- Any ambiguous credit not clearly from seller or lender→unknownCredit
+
+Rate: number only e.g. "5.125". Purchase Price→purchasePrice. "Cash TO(-)/FROM Borrower"→cashToClose.`;
 
 async function extractFromDocument(file) {
   const base64 = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result.split(",")[1]); r.onerror = rej; r.readAsDataURL(file); });
@@ -161,22 +175,32 @@ function AlertBanner({ alerts }) {
 function DocumentUpload({ quoteIndex, onExtracted }) {
   const [status, setStatus] = useState("idle");
   const [err, setErr] = useState("");
+  const [dragging, setDragging] = useState(false);
   const ref = useRef();
-  const handle = async (file) => {
-    if (!file || !["application/pdf", "image/png", "image/jpeg", "image/webp"].includes(file.type)) { setStatus("error"); setErr("Upload a PDF or image"); return; }
+  const processFile = async (file) => {
+    if (!file || !["application/pdf", "image/png", "image/jpeg", "image/webp"].includes(file.type)) { setStatus("error"); setErr("Upload a PDF or image (PNG, JPG)"); return; }
     setStatus("uploading"); setErr("");
-    try { const ex = await extractFromDocument(file); onExtracted(quoteIndex, { ...EMPTY_QUOTE(), ...ex, loanProgram: "Conventional", term: ex.term || 30 }); setStatus("success"); setTimeout(() => setStatus("idle"), 3000); }
-    catch (e) { setStatus("error"); setErr(e.message?.includes("API") || e.message?.includes("fetch") ? "AI features unavailable. You can still enter data manually below." : "Could not extract: " + e.message); }
+    try { const ex = await extractFromDocument(file); onExtracted(quoteIndex, ex); setStatus("success"); setTimeout(() => setStatus("idle"), 3000); }
+    catch (e) { setStatus("error"); setErr(e.message?.includes("API") || e.message?.includes("fetch") ? "AI features unavailable. Enter data manually below." : "Could not extract: " + e.message); }
   };
+  const onDragOver = (e) => { e.preventDefault(); e.stopPropagation(); setDragging(true); };
+  const onDragLeave = (e) => { e.preventDefault(); e.stopPropagation(); setDragging(false); };
+  const onDrop = (e) => { e.preventDefault(); e.stopPropagation(); setDragging(false); const file = e.dataTransfer?.files?.[0]; if (file) processFile(file); };
   return (
     <div style={{ marginBottom: 12 }}>
-      <input ref={ref} type="file" accept=".pdf,image/*" capture="environment" onChange={e => handle(e.target.files?.[0])} style={{ display: "none" }} />
-      <button onClick={() => ref.current?.click()} disabled={status === "uploading"} style={{ width: "100%", padding: "10px", borderRadius: 10, border: status === "success" ? "2px solid #059669" : status === "error" ? "2px solid #DC2626" : "2px dashed #CBD5E1", background: status === "success" ? "#ECFDF5" : "#fff", cursor: status === "uploading" ? "wait" : "pointer", fontSize: 12, color: status === "success" ? "#059669" : status === "error" ? "#DC2626" : "#94A3B8", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
-        {status === "idle" && "📄 Upload Loan Estimate (PDF / Photo)"}
-        {status === "uploading" && <><span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>⏳</span> Extracting with AI...</>}
-        {status === "success" && "✅ Data extracted!"}
-        {status === "error" && `❌ ${err}`}
-      </button>
+      <input ref={ref} type="file" accept=".pdf,image/*" capture="environment" onChange={e => processFile(e.target.files?.[0])} style={{ display: "none" }} />
+      <div onClick={() => ref.current?.click()} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}
+        style={{ width: "100%", padding: status === "idle" ? "18px 10px" : "10px", borderRadius: 12, textAlign: "center",
+          border: dragging ? "2px solid #C9A84C" : status === "success" ? "2px solid #059669" : status === "error" ? "2px solid #DC2626" : "2px dashed #CBD5E1",
+          background: dragging ? "#FFFBEB" : status === "success" ? "#ECFDF5" : "#fff",
+          cursor: status === "uploading" ? "wait" : "pointer", fontSize: 12,
+          color: dragging ? "#92400E" : status === "success" ? "#059669" : status === "error" ? "#DC2626" : "#94A3B8",
+          transition: "all 0.2s" }}>
+        {status === "idle" && <><div style={{ fontSize: 20, marginBottom: 4 }}>{dragging ? "📥" : "📄"}</div><div style={{ fontWeight: 600 }}>{dragging ? "Drop your file here!" : "Drag & Drop Loan Estimate Here"}</div><div style={{ fontSize: 10, marginTop: 2, opacity: 0.7 }}>or click to browse · PDF, PNG, JPG</div></>}
+        {status === "uploading" && <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}><span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>⏳</span> Extracting with AI...</div>}
+        {status === "success" && <div>✅ Data extracted!</div>}
+        {status === "error" && <div>❌ {err}</div>}
+      </div>
     </div>
   );
 }
@@ -202,7 +226,7 @@ Horizon: ${horizon}yr.\nQUOTES:\n${analysis.map(a => `${a.name} (${a.rate}%) Off
   };
   const tips = ["Which option saves most over 5 years?", "Is buying down the rate worth it?", "Explain the fee differences", "What should I ask each lender?"];
   return (
-    <div style={{ background: "#fff", borderRadius: 16, border: "1px solid #E8E4DC", overflow: "hidden", marginBottom: 16, boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
+    <div style={{ background: "#fff", borderRadius: 16, border: "1px solid #E8E4DC", overflow: "hidden", marginBottom: 16, boxShadow: "0 2px 12px rgba(0,0,0,0.06)" }}>
       <div style={{ padding: "14px 20px", background: "linear-gradient(135deg, #1B3A2D, #2D5A45)", color: "#fff", display: "flex", alignItems: "center", gap: 10 }}>
         <span style={{ fontSize: 20 }}>💬</span>
         <div><div style={{ fontSize: 14, fontWeight: 600 }}>Ask About Your Quotes</div><div style={{ fontSize: 11, opacity: 0.7 }}>AI advisor with full context of your quotes</div></div>
@@ -238,7 +262,7 @@ function BucketGroup({ title, bucketNum, controlled, children }) {
 }
 
 function QuoteCard({ quote, index, onChange, onRemove, canRemove }) {
-  const c = COLORS[index % 4]; const up = f => v => onChange(index, { ...quote, [f]: v });
+  const c = COLORS[index % 4]; const up = f => v => onChange(index, { ...quote, [f]: v, _fromUI: true });
   return (
     <div style={{ background: "#fff", borderRadius: 14, border: "1px solid #E8E4DC", borderTop: `4px solid ${c.bg}`, padding: "16px 18px", flex: "1 1 280px", minWidth: 280, position: "relative" }}>
       {canRemove && <button onClick={() => onRemove(index)} style={{ position: "absolute", top: 10, right: 12, background: "none", border: "none", cursor: "pointer", color: "#71717a", fontSize: 18 }}>×</button>}
@@ -253,7 +277,7 @@ function QuoteCard({ quote, index, onChange, onRemove, canRemove }) {
         <Input label="Loan Officer" value={quote.loanOfficer} onChange={up("loanOfficer")} />
         <div style={{ flex: "1 1 120px" }}>
           <label style={{ display: "block", fontSize: 10, color: "#71717a", marginBottom: 3, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>Program</label>
-          <select value={quote.loanProgram} onChange={e => onChange(index, { ...quote, loanProgram: e.target.value })} style={{ width: "100%", padding: "6px 8px", borderRadius: 8, border: "1px solid #E8E4DC", fontSize: 12, background: "#fafafa" }}>
+          <select value={quote.loanProgram} onChange={e => onChange(index, { ...quote, loanProgram: e.target.value, _fromUI: true })} style={{ width: "100%", padding: "6px 8px", borderRadius: 8, border: "1px solid #E8E4DC", fontSize: 12, background: "#fafafa" }}>
             <option value="Conventional">Conventional</option><option value="FHA">FHA</option><option value="VA">VA</option><option value="USDA">USDA</option>
           </select>
         </div>
@@ -262,7 +286,7 @@ function QuoteCard({ quote, index, onChange, onRemove, canRemove }) {
         <Input label="Purchase Price" value={quote.purchasePrice} onChange={up("purchasePrice")} prefix="$" />
         <Input label="Loan Amount" value={quote.loanAmount} onChange={up("loanAmount")} prefix="$" />
         <Input label="Rate" value={quote.rate} onChange={up("rate")} suffix="%" />
-        <Input label="Term" value={quote.term} onChange={v => onChange(index, { ...quote, term: parseInt(v) || 30 })} suffix="yr" />
+        <Input label="Term" value={quote.term} onChange={v => onChange(index, { ...quote, term: parseInt(v) || 30, _fromUI: true })} suffix="yr" />
       </div>
       <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 8px", marginBottom: 8 }}>
         <Input label="Cash to Close" value={quote.cashToClose} onChange={up("cashToClose")} prefix="$" />
@@ -349,7 +373,20 @@ export default function MortgageCompare() {
 
   const alerts = detectAlerts(quotes);
 
-  const handleQuoteChange = (i, data) => { const q = [...quotes]; q[i] = data; setQuotes(q); };
+  const handleQuoteChange = (i, data) => {
+    setQuotes(prev => {
+      const q = [...prev];
+      // Check if this is extracted AI data (has rate/loanAmount but missing UI-managed fields like loanProgram form state)
+      if (typeof data === "object" && data.rate && !("_fromUI" in data)) {
+        q[i] = { ...EMPTY_QUOTE(), ...data, loanProgram: data.loanProgram || "Conventional", term: data.term || 30 };
+      } else {
+        // Direct field update from UI
+        const clean = { ...data }; delete clean._fromUI;
+        q[i] = clean;
+      }
+      return q;
+    });
+  };
   const handleRemove = (i) => { if (quotes.length > 2) setQuotes(quotes.filter((_, j) => j !== i)); };
   const handleAdd = () => { if (quotes.length < 4) setQuotes([...quotes, EMPTY_QUOTE()]); };
   const handleEditOfficer = (quoteAnalysisIndex, name) => {
@@ -386,7 +423,7 @@ export default function MortgageCompare() {
   const hasData = analysis.length >= 2;
 
   return (
-    <div style={{ minHeight: "100vh", background: "#F7F5F0", "--mono": "'JetBrains Mono', 'SF Mono', monospace" }}>
+    <div style={{ minHeight: "100vh", background: "linear-gradient(180deg, #F7F5F0 0%, #EDE9E0 100%)", "--mono": "'JetBrains Mono', 'SF Mono', monospace" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700&family=Source+Sans+3:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -442,7 +479,7 @@ export default function MortgageCompare() {
 
       <div style={{ maxWidth: 960, margin: "0 auto", padding: "16px 24px 60px", fontFamily: "'Source Sans 3', sans-serif" }}>
         {/* Time Horizon */}
-        <div style={{ background: "#fff", borderRadius: 10, padding: "10px 16px", marginBottom: 16, border: "1px solid #E8E4DC", display: "flex", alignItems: "center", gap: 12, boxShadow: "0 1px 2px rgba(0,0,0,0.03)" }}>
+        <div style={{ background: "#fff", borderRadius: 10, padding: "10px 16px", marginBottom: 16, border: "1px solid #E8E4DC", display: "flex", alignItems: "center", gap: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.05)" }}>
           <span style={{ fontSize: 10, color: "#71717a", textTransform: "uppercase", fontWeight: 600, letterSpacing: "0.06em" }}>Time Horizon</span>
           <input type="range" min="1" max="15" value={num(constraints.timeHorizon) || 7} onChange={e => setConstraints({ ...constraints, timeHorizon: e.target.value })} style={{ width: 140, accentColor: "#C9A84C" }} />
           <span style={{ fontSize: 15, fontWeight: 700, fontFamily: "var(--mono)", color: "#1B3A2D" }}>{num(constraints.timeHorizon) || 7} years</span>
@@ -484,7 +521,7 @@ export default function MortgageCompare() {
                 ["2", "📊", "See the Real Comparison", "We break down fees into what matters: lender fees, points, and your rate — cutting through the noise."],
                 ["3", "💬", "Get AI Guidance", "Ask questions, compare time horizons, check loan officer reputations, and see the breakeven math."],
               ].map(([n, icon, title, desc]) => (
-                <div key={n} style={{ flex: "1 1 180px", maxWidth: 220, textAlign: "center", padding: "24px 16px", background: "#fff", borderRadius: 14, border: "1px solid #E8E4DC", boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}>
+                <div key={n} style={{ flex: "1 1 180px", maxWidth: 220, textAlign: "center", padding: "24px 16px", background: "#fff", borderRadius: 14, border: "1px solid #E8E4DC", boxShadow: "0 2px 12px rgba(0,0,0,0.06)" }}>
                   <div style={{ width: 34, height: 34, borderRadius: "50%", background: "linear-gradient(135deg, #C9A84C, #E8C860)", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700, color: "#fff", marginBottom: 10, boxShadow: "0 2px 6px rgba(201,168,76,0.3)" }}>{n}</div>
                   <div style={{ fontSize: 22, marginBottom: 6 }}>{icon}</div>
                   <div style={{ fontSize: 13, fontWeight: 700, color: "#1B3A2D", marginBottom: 4 }}>{title}</div>
@@ -536,7 +573,7 @@ ${analysis.map(a => `<div class="quote" style="border-left-color:${a.color.bg}">
             </div>
 
             {/* Scenarios */}
-            <div className="fade-up" style={{ background: "#fff", borderRadius: 16, border: "1px solid #E8E4DC", padding: 20, marginBottom: 16, boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
+            <div className="fade-up" style={{ background: "#fff", borderRadius: 16, border: "1px solid #E8E4DC", padding: 20, marginBottom: 16, boxShadow: "0 2px 12px rgba(0,0,0,0.06)" }}>
               <div style={{ fontSize: 20, fontFamily: "'Playfair Display', serif", marginBottom: 3 }}>What Matters Most to You?</div>
               <div style={{ fontSize: 11, color: "#71717a", marginBottom: 14 }}>Pick a priority — the recommendation updates instantly</div>
               <div className="grid-scenarios" style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
@@ -562,7 +599,7 @@ ${analysis.map(a => `<div class="quote" style="border-left-color:${a.color.bg}">
             </div>
 
             {/* Reputation with editable loan officer */}
-            <div className="fade-up" style={{ background: "#fff", borderRadius: 16, border: "1px solid #E8E4DC", padding: 20, marginBottom: 16, boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
+            <div className="fade-up" style={{ background: "#fff", borderRadius: 16, border: "1px solid #E8E4DC", padding: 20, marginBottom: 16, boxShadow: "0 2px 12px rgba(0,0,0,0.06)" }}>
               <div style={{ fontSize: 20, fontFamily: "'Playfair Display', serif", marginBottom: 3 }}>Loan Officer Reputation</div>
               <div style={{ fontSize: 11, color: "#71717a", marginBottom: 12 }}>Add or edit loan officer names, then look up their reviews</div>
               <div className="grid-rep" style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(analysis.length, 2)}, 1fr)`, gap: 10 }}>
@@ -592,8 +629,10 @@ ${analysis.map(a => `<div class="quote" style="border-left-color:${a.color.bg}">
             <AIChat analysis={analysis} horizon={horizon} alerts={alerts} reps={reps} />
 
             {/* Winner */}
-            <div className="fade-up" style={{ background: best.color.grad, borderRadius: 16, padding: "24px 28px", color: "#fff", marginBottom: 16, position: "relative", overflow: "hidden", boxShadow: "0 4px 16px rgba(0,0,0,0.15)" }}>
-              <div style={{ position: "absolute", top: -30, right: -30, width: 140, height: 140, borderRadius: "50%", background: "rgba(255,255,255,0.06)" }} />
+            <div className="fade-up" style={{ background: best.color.grad, borderRadius: 16, padding: "28px 32px", color: "#fff", marginBottom: 20, position: "relative", overflow: "hidden", boxShadow: "0 8px 32px rgba(0,0,0,0.2)" }}>
+              <div style={{ position: "absolute", top: -40, right: -40, width: 180, height: 180, borderRadius: "50%", background: "rgba(255,255,255,0.06)" }} />
+              <div style={{ position: "absolute", bottom: -20, left: 40, width: 100, height: 100, borderRadius: "50%", background: "rgba(255,255,255,0.04)" }} />
+              <div style={{ position: "absolute", top: 16, right: 20, background: "rgba(201,168,76,0.25)", border: "1px solid rgba(201,168,76,0.4)", padding: "4px 12px", borderRadius: 20, fontSize: 10, fontWeight: 700, letterSpacing: "0.08em" }}>★ BEST VALUE</div>
               <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.14em", opacity: 0.6 }}>Best Overall — {horizon} Year Horizon</div>
               <div style={{ fontSize: 28, fontFamily: "'Playfair Display', serif", marginTop: 4 }}>{best.name}</div>
               {best.officer && <div style={{ fontSize: 13, opacity: 0.7 }}>with {best.officer}</div>}
@@ -607,7 +646,7 @@ ${analysis.map(a => `<div class="quote" style="border-left-color:${a.color.bg}">
             {/* Quick Cards */}
             <div className="grid-cards" style={{ display: "grid", gridTemplateColumns: `repeat(${analysis.length}, 1fr)`, gap: 10, marginBottom: 16 }}>
               {analysis.map(a => (
-                <div key={a.i} className="fade-up" style={{ background: a.i === best.i ? a.color.fg : "#fff", border: `2px solid ${a.i === best.i ? a.color.bg : "#E8E4DC"}`, borderRadius: 14, padding: 14, position: "relative", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
+                <div key={a.i} className="fade-up" style={{ background: a.i === best.i ? a.color.fg : "#fff", border: `2px solid ${a.i === best.i ? a.color.bg : "#E8E4DC"}`, borderRadius: 14, padding: 14, position: "relative", boxShadow: "0 2px 12px rgba(0,0,0,0.06)" }}>
                   {a.i === best.i && <div style={{ position: "absolute", top: -1, right: 10, background: a.color.bg, color: "#fff", fontSize: 8, fontWeight: 700, padding: "3px 8px", borderRadius: "0 0 6px 6px" }}>BEST</div>}
                   <div style={{ fontSize: 13, fontWeight: 700, color: a.color.bg, marginBottom: 6 }}>{a.name}</div>
                   <div style={{ fontSize: 20, fontFamily: "var(--mono)" }}>{a.rate}%</div>
@@ -629,7 +668,7 @@ ${analysis.map(a => `<div class="quote" style="border-left-color:${a.color.bg}">
             {hasMultiProg && <MultiProgramView analysis={analysis} programs={uniqueProgs} horizon={horizon} />}
 
             {/* Breakeven */}
-            <div className="fade-up" style={{ background: "#fff", borderRadius: 16, border: "1px solid #E8E4DC", padding: 20, marginBottom: 16, boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
+            <div className="fade-up" style={{ background: "#fff", borderRadius: 16, border: "1px solid #E8E4DC", padding: 20, marginBottom: 16, boxShadow: "0 2px 12px rgba(0,0,0,0.06)" }}>
               <div style={{ fontSize: 20, fontFamily: "'Playfair Display', serif", marginBottom: 12 }}>Breakeven Analysis</div>
               <div className="grid-breakeven" style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
                 {analysis.map(a => {
@@ -649,7 +688,7 @@ ${analysis.map(a => `<div class="quote" style="border-left-color:${a.color.bg}">
             </div>
 
             {/* Bottom Line */}
-            <div className="fade-up" style={{ background: "#fff", borderRadius: 16, border: "1px solid #E8E4DC", padding: 20, marginBottom: 16, boxShadow: "0 1px 3px rgba(0,0,0,0.04)", fontSize: 14, lineHeight: 1.85, color: "#4B5563" }}>
+            <div className="fade-up" style={{ background: "#fff", borderRadius: 16, border: "1px solid #E8E4DC", padding: 20, marginBottom: 16, boxShadow: "0 2px 12px rgba(0,0,0,0.06)", fontSize: 14, lineHeight: 1.85, color: "#4B5563" }}>
               <div style={{ fontSize: 20, fontFamily: "'Playfair Display', serif", marginBottom: 10, color: "#1a1a1a" }}>The Bottom Line</div>
               {(() => {
                 const lines = [];
