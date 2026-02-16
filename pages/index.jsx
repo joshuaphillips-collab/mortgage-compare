@@ -319,15 +319,21 @@ export default function MortgageCompare() {
   const handleAdd = () => { if (quotes.length < 4) setQuotes(prev => [...prev, EMPTY_QUOTE()]); };
   const [welcomeUpload, setWelcomeUpload] = useState({ status: "idle", msg: "", slot: 0 });
   const handleWelcomeFile = async (file) => {
-    setWelcomeUpload({ status: "loading", msg: "", slot: welcomeUpload.slot });
+    setWelcomeUpload(prev => ({ ...prev, status: "loading", msg: "" }));
     try {
       const ex = await extractFromDocument(file);
       const slot = welcomeUpload.slot;
       setQuotes(prev => { const q = [...prev]; q[slot] = { ...EMPTY_QUOTE(), ...ex, loanProgram: ex.loanProgram || "Conventional", term: ex.term || 30 }; return q; });
       const nextSlot = slot + 1;
-      setWelcomeUpload({ status: "success", msg: `${ex.lenderName || "Quote"} at ${ex.rate || "?"}% loaded!`, slot: nextSlot < quotes.length ? nextSlot : slot });
+      setWelcomeUpload(prev => ({ status: "success", msg: `${ex.lenderName || "Quote"} at ${ex.rate || "?"}% loaded!`, slot: nextSlot < quotes.length ? nextSlot : slot }));
       setTimeout(() => setWelcomeUpload(prev => ({ ...prev, status: "idle", msg: "" })), 3000);
-    } catch (e) { setWelcomeUpload({ status: "error", msg: e.message || "Extraction failed", slot: welcomeUpload.slot }); setTimeout(() => setWelcomeUpload(prev => ({ ...prev, status: "idle" })), 4000); }
+    } catch (e) { setWelcomeUpload(prev => ({ ...prev, status: "error", msg: e.message || "Extraction failed" })); setTimeout(() => setWelcomeUpload(prev => ({ ...prev, status: "idle" })), 4000); }
+  };
+  const handleAddWelcomeSlot = () => {
+    if (quotes.length < 4) {
+      setQuotes(prev => [...prev, EMPTY_QUOTE()]);
+      setWelcomeUpload(prev => ({ ...prev, slot: quotes.length })); // point to the new slot
+    }
   };
   const months = horizon * 12;
   const analysis = quotes.filter(q => num(q.loanAmount) > 0 && num(q.rate) > 0).map((q, i) => {
@@ -342,11 +348,28 @@ export default function MortgageCompare() {
   const baseline = analysis.find(a => a.rate === baseRate);
   const handleLookupRep = async (officer, lender) => {
     const key = `${officer}|${lender}`;
-    if (reps[key] || repLoading[key]) return;
+    if (repLoading[key]) return; // already in progress
     setRepLoading(prev => ({ ...prev, [key]: true }));
-    const r = await lookupReputation(officer, lender);
-    setReps(prev => ({ ...prev, [key]: r }));
+    // Clear any previous failed result so retry works
+    setReps(prev => { const n = { ...prev }; delete n[key]; return n; });
+    try {
+      const r = await lookupReputation(officer, lender);
+      setReps(prev => ({ ...prev, [key]: r }));
+    } catch (e) {
+      setReps(prev => ({ ...prev, [key]: { rating: 0, reviewCount: 0, summary: "Search failed. Please try again.", highlights: [], concerns: [], sources: [], _failed: true } }));
+    }
     setRepLoading(prev => ({ ...prev, [key]: false }));
+  };
+  // Sequential lookup - looks up all officers one at a time
+  const handleLookupAll = async () => {
+    for (const a of analysis) {
+      if (a.officer) {
+        const key = `${a.officer}|${a.name}`;
+        if (!reps[key] || reps[key]._failed) {
+          await handleLookupRep(a.officer, a.name);
+        }
+      }
+    }
   };
   const handleEditOfficer = (analysisIdx, name) => {
     const valid = quotes.filter(q => num(q.loanAmount) > 0 && num(q.rate) > 0);
@@ -424,19 +447,35 @@ export default function MortgageCompare() {
 
             {/* Upload card */}
             <div className="glass-card" style={{ borderRadius: 24, padding: "32px", marginBottom: 28 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
-                <div style={{ width: 28, height: 28, borderRadius: 8, background: `linear-gradient(135deg, ${T.gold}, ${T.goldLight})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700, color: "#fff" }}>{welcomeUpload.slot + 1}</div>
-                <div>
-                  <div style={{ fontSize: 16, fontWeight: 600, color: T.green, fontFamily: "var(--heading)" }}>Upload Quote {welcomeUpload.slot + 1} of {quotes.length}</div>
-                  <div style={{ fontSize: 12, color: T.textLight }}>We'll extract all the fees automatically</div>
-                </div>
-              </div>
-              <DropZone large onFile={handleWelcomeFile} status={welcomeUpload.status} message={welcomeUpload.msg} />
-              {analysis.length > 0 && <div style={{ marginTop: 18, padding: 16, background: `linear-gradient(135deg, ${T.greenPale}, rgba(216,243,220,0.3))`, borderRadius: 14, border: `1px solid rgba(27,67,50,0.1)` }}>
-                <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.1em", color: T.textLight, fontWeight: 700, marginBottom: 8 }}>Uploaded</div>
-                {analysis.map((a, j) => <div key={j} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", color: T.green, fontWeight: 600, fontSize: 14 }}><span>{a.name}</span><span style={{ fontFamily: "var(--mono)", fontSize: 16 }}>{a.rate}%</span></div>)}
-                {analysis.length < 2 && <div style={{ color: T.textLight, marginTop: 6, fontSize: 12, fontStyle: "italic" }}>Upload one more to start comparing</div>}
+              {/* Show uploaded quotes */}
+              {analysis.length > 0 && <div style={{ marginBottom: 20, padding: 16, background: `linear-gradient(135deg, ${T.greenPale}, rgba(216,243,220,0.3))`, borderRadius: 14, border: `1px solid rgba(27,67,50,0.1)` }}>
+                <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.1em", color: T.textLight, fontWeight: 700, marginBottom: 8 }}>Quotes Uploaded</div>
+                {analysis.map((a, j) => <div key={j} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", color: T.green, fontWeight: 600, fontSize: 14 }}><span>✅ {a.name}</span><span style={{ fontFamily: "var(--mono)", fontSize: 16 }}>{a.rate}%</span></div>)}
               </div>}
+
+              {/* Upload zone - show if there's still an empty slot */}
+              {welcomeUpload.slot < quotes.length && !quotes.every(q => num(q.loanAmount) > 0) && <>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+                  <div style={{ width: 28, height: 28, borderRadius: 8, background: `linear-gradient(135deg, ${T.gold}, ${T.goldLight})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700, color: "#fff" }}>{welcomeUpload.slot + 1}</div>
+                  <div>
+                    <div style={{ fontSize: 16, fontWeight: 600, color: T.green, fontFamily: "var(--heading)" }}>Upload Quote {welcomeUpload.slot + 1} of {quotes.length}</div>
+                    <div style={{ fontSize: 12, color: T.textLight }}>We'll extract all the fees automatically</div>
+                  </div>
+                </div>
+                <DropZone large onFile={handleWelcomeFile} status={welcomeUpload.status} message={welcomeUpload.msg} />
+              </>}
+
+              {/* All slots filled — offer to add more or proceed */}
+              {quotes.every(q => num(q.loanAmount) > 0) && <>
+                <div style={{ textAlign: "center", padding: "8px 0" }}>
+                  <div style={{ fontSize: 14, color: T.textMid, marginBottom: 12 }}>All {quotes.length} quotes uploaded! {quotes.length < 4 ? "Need to add more?" : ""}</div>
+                  <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+                    {quotes.length < 4 && <button onClick={handleAddWelcomeSlot} style={{ padding: "12px 24px", borderRadius: 12, border: `2px dashed ${T.border}`, background: "rgba(255,255,255,0.5)", cursor: "pointer", fontSize: 13, fontWeight: 600, color: T.textMid, transition: "all 0.2s" }}>+ Add Another Quote (up to 4)</button>}
+                  </div>
+                </div>
+              </>}
+
+              {analysis.length === 1 && <div style={{ textAlign: "center", color: T.textLight, marginTop: 12, fontSize: 13, fontStyle: "italic" }}>Upload one more to start comparing</div>}
             </div>
 
             {/* How it works */}
@@ -534,17 +573,23 @@ export default function MortgageCompare() {
 
             {/* Reputation */}
             <div className="fade-up glass-card" style={{ animationDelay: "0.15s", borderRadius: 24, padding: "32px 36px", marginBottom: 24 }}>
-              <div style={{ fontSize: 26, fontFamily: "var(--heading)", color: T.green, marginBottom: 4 }}>Loan Officer Reputation</div>
-              <div style={{ fontSize: 14, color: T.textLight, marginBottom: 18 }}>Enter names and look up their online reviews across Birdeye, Google, and more</div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 18, flexWrap: "wrap", gap: 10 }}>
+                <div>
+                  <div style={{ fontSize: 26, fontFamily: "var(--heading)", color: T.green, marginBottom: 4 }}>Loan Officer Reputation</div>
+                  <div style={{ fontSize: 14, color: T.textLight }}>Reviews from Birdeye, Google, and more — looked up one at a time</div>
+                </div>
+                {analysis.filter(a => a.officer).length >= 2 && <button onClick={handleLookupAll} disabled={Object.values(repLoading).some(v => v)} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: Object.values(repLoading).some(v => v) ? T.warmGray : `linear-gradient(135deg, ${T.green}, ${T.greenLight})`, color: Object.values(repLoading).some(v => v) ? T.textLight : "#fff", cursor: "pointer", fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", boxShadow: `0 2px 8px ${T.green}22` }}>{Object.values(repLoading).some(v => v) ? "Searching..." : "⭐ Look Up All"}</button>}
+              </div>
               <div className="resp-grid" style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(analysis.length, 2)}, 1fr)`, gap: 14 }}>
-                {analysis.map(a => { const key = `${a.officer}|${a.name}`; const rep = reps[key]; const isLoading = repLoading[key]; return (
+                {analysis.map(a => { const key = `${a.officer}|${a.name}`; const rep = reps[key]; const isLoading = repLoading[key]; const failed = rep && rep._failed; return (
                   <div key={a.i} style={{ padding: 18, background: T.warmGray, borderRadius: 16, borderLeft: `5px solid ${a.color.bg}` }}>
                     <div style={{ fontSize: 15, fontWeight: 700, color: a.color.bg, fontFamily: "var(--heading)", marginBottom: 10 }}>{a.name}</div>
                     <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10 }}>
                       <input type="text" value={a.officer} onChange={e => handleEditOfficer(a.i, e.target.value)} placeholder="Enter loan officer name..." style={{ flex: 1, padding: "10px 14px", borderRadius: 10, border: `1px solid ${T.border}`, fontSize: 13, outline: "none", background: T.white, fontFamily: "var(--body)" }} />
-                      {a.officer && !rep && <button onClick={() => handleLookupRep(a.officer, a.name)} disabled={isLoading} style={{ padding: "10px 18px", borderRadius: 10, border: "none", background: isLoading ? T.warmGray : `linear-gradient(135deg, ${T.green}, ${T.greenLight})`, color: isLoading ? T.textLight : "#fff", cursor: isLoading ? "wait" : "pointer", fontSize: 11, whiteSpace: "nowrap", fontWeight: 600, boxShadow: isLoading ? "none" : `0 2px 8px ${T.green}33` }}>{isLoading ? "Searching..." : "⭐ Look up"}</button>}
+                      {a.officer && (!rep || failed) && <button onClick={() => handleLookupRep(a.officer, a.name)} disabled={isLoading} style={{ padding: "10px 18px", borderRadius: 10, border: "none", background: isLoading ? T.warmGray : `linear-gradient(135deg, ${T.green}, ${T.greenLight})`, color: isLoading ? T.textLight : "#fff", cursor: isLoading ? "wait" : "pointer", fontSize: 11, whiteSpace: "nowrap", fontWeight: 600, boxShadow: isLoading ? "none" : `0 2px 8px ${T.green}33` }}>{isLoading ? "Searching..." : failed ? "🔄 Retry" : "⭐ Look up"}</button>}
                     </div>
-                    {rep && <div style={{ padding: 14, background: T.white, borderRadius: 12 }}>
+                    {isLoading && <div style={{ padding: 10, fontSize: 12, color: T.textLight, textAlign: "center" }}><span className="spin">⏳</span> Searching Birdeye, Google, and more... this takes a moment</div>}
+                    {rep && !failed && <div style={{ padding: 14, background: T.white, borderRadius: 12 }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
                         {rep.rating > 0 && <span style={{ fontSize: 28, fontWeight: 700, fontFamily: "var(--mono)", color: T.green }}>{rep.rating.toFixed(1)}</span>}
                         {rep.rating > 0 && <div><div style={{ fontSize: 16, color: "#F59E0B" }}>{"★".repeat(Math.floor(rep.rating))}{"☆".repeat(5 - Math.floor(rep.rating))}</div><div style={{ fontSize: 11, color: T.textLight }}>{rep.reviewCount} reviews</div></div>}
@@ -553,6 +598,7 @@ export default function MortgageCompare() {
                       {rep.highlights?.length > 0 && <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 6 }}>{rep.highlights.map((h, j) => <span key={j} style={{ fontSize: 10, padding: "3px 10px", background: T.greenPale, color: T.green, borderRadius: 12, fontWeight: 600 }}>✓ {h}</span>)}</div>}
                       {rep.sources?.length > 0 && <div style={{ fontSize: 10, color: T.textLight, marginTop: 6 }}>Sources: {rep.sources.join(" · ")}</div>}
                     </div>}
+                    {failed && <div style={{ padding: 10, fontSize: 12, color: T.danger, textAlign: "center" }}>Search failed — click Retry to try again</div>}
                   </div>);
                 })}
               </div>
