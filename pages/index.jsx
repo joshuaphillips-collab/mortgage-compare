@@ -94,32 +94,55 @@ async function extractFromDocument(file) {
 
 // ─── Reputation Lookup (with better error handling) ───
 async function lookupReputation(officer, lender) {
+  const sysPrompt = `You are researching a loan officer's online reputation.
+
+Search for: "${officer}" at "${lender}"
+Check: Birdeye.com (primary — often has hundreds of reviews), the lender's website, Google reviews, Zillow, LendingTree, SocialSurvey.
+
+Return ONLY a JSON object (no markdown, no backticks):
+{"rating":4.9,"reviewCount":671,"summary":"2-3 sentence summary","highlights":["theme 1","theme 2"],"concerns":[],"sources":["Birdeye (671 reviews)","Google (15 reviews)"]}
+
+If you cannot find info: {"rating":0,"reviewCount":0,"summary":"No reviews found online. Try birdeye.com directly.","highlights":[],"concerns":[],"sources":[]}`;
+
+  const userMsg = `Research the online reputation of loan officer ${officer} at ${lender}. Search Birdeye first, then the lender website, then Google/Zillow. Report total reviews and rating.`;
+
+  const parseResponse = (data) => {
+    const textParts = (data.content || []).filter(b => b.type === "text").map(b => b.text);
+    const fullText = textParts.join("\n");
+    const jsonMatch = fullText.match(/\{[\s\S]*?"rating"[\s\S]*?\}/);
+    if (jsonMatch) {
+      try { return JSON.parse(jsonMatch[0]); } catch {}
+    }
+    return null;
+  };
+
+  // Attempt 1: with web_search tool (best results)
   try {
     const resp = await fetch(API, { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 2000,
-        system: `You are researching a loan officer's online reputation. Do a THOROUGH search using multiple queries.
-
-REQUIRED SEARCHES (do all of these):
-1. Search: "${officer} birdeye reviews" — Birdeye.com is the PRIMARY review platform for loan officers with the most reviews. This is your most important source.
-2. Search: "${officer} ${lender} reviews" — Check the lender's own website for their profile and reviews.
-3. Search: "${officer} loan officer reviews" — Find Google, Zillow, LendingTree, SocialSurvey, or other platforms.
-
-CRITICAL: Birdeye typically has MANY MORE reviews than Google alone (often hundreds). Always prioritize Birdeye data for the review count. Combine all sources for the complete picture.
-
-After ALL searches, return ONLY a JSON object (no markdown, no backticks):
-{"rating":4.9,"reviewCount":671,"summary":"2-3 sentence summary combining findings from all sources","highlights":["theme 1","theme 2","theme 3"],"concerns":[],"sources":["Birdeye (671 reviews, 4.9 stars)","Google (15 reviews)","Company website"]}
-
-If you cannot find the person, return: {"rating":0,"reviewCount":0,"summary":"No reviews found. Try birdeye.com directly.","highlights":[],"concerns":[],"sources":[]}`,
-        messages: [{ role: "user", content: `Thoroughly research loan officer ${officer} at ${lender}. Search Birdeye first (most important — has the most reviews), then the lender's website, then Google and other review sites. Report the TOTAL reviews across all platforms with their overall rating.` }],
+      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 2000, system: sysPrompt,
+        messages: [{ role: "user", content: userMsg }],
         tools: [{ type: "web_search_20250305", name: "web_search" }] }) });
-    if (!resp.ok) return { rating: 0, reviewCount: 0, summary: "Could not connect. Reputation search requires an active API connection.", highlights: [], concerns: [], sources: [] };
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error.message || "API error");
+      const result = parseResponse(data);
+      if (result) return result;
+    }
+  } catch (e) { /* fall through to attempt 2 */ }
+
+  // Attempt 2: without tools (uses training knowledge only)
+  try {
+    const resp = await fetch(API, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1500, system: sysPrompt,
+        messages: [{ role: "user", content: userMsg + "\n\nNote: Web search is unavailable. Use your training knowledge about this person if you have any. If you have no information, say so honestly." }] }) });
+    if (!resp.ok) return { rating: 0, reviewCount: 0, summary: "Could not connect to the AI service. Check that the API key is configured correctly in Vercel.", highlights: [], concerns: [], sources: [], _failed: true };
     const data = await resp.json();
-    const fullText = (data.content?.filter(b => b.type === "text").map(b => b.text) || []).join("\n");
-    const jsonMatch = fullText.match(/\{[\s\S]*"rating"[\s\S]*\}/);
-    if (jsonMatch) return JSON.parse(jsonMatch[0]);
-    return { rating: 0, reviewCount: 0, summary: "Search completed but couldn't parse results. Try birdeye.com directly.", highlights: [], concerns: [], sources: [] };
+    if (data.error) return { rating: 0, reviewCount: 0, summary: "API error: " + (data.error.message || "Unknown"), highlights: [], concerns: [], sources: [], _failed: true };
+    const result = parseResponse(data);
+    if (result) { result.summary = (result.summary || "") + " (Note: Based on training data — live search unavailable. Results may not reflect current reviews.)"; return result; }
+    return { rating: 0, reviewCount: 0, summary: "Could not find information. Try searching birdeye.com directly.", highlights: [], concerns: [], sources: [], _failed: true };
   } catch (e) {
-    return { rating: 0, reviewCount: 0, summary: "Error: " + (e.message || "Unknown error"), highlights: [], concerns: [], sources: [] };
+    return { rating: 0, reviewCount: 0, summary: "Connection error: " + (e.message || "Unknown"), highlights: [], concerns: [], sources: [], _failed: true };
   }
 }
 
@@ -306,6 +329,7 @@ export default function MortgageCompare() {
   const [weights, setWeights] = useState(SCENARIOS[0].w);
   const [reps, setReps] = useState({});
   const [repLoading, setRepLoading] = useState({});
+  const [showBreakevenInfo, setShowBreakevenInfo] = useState(false);
   const alerts = detectAlerts(quotes);
   const handleQuoteChange = useCallback((i, data) => {
     setQuotes(prev => {
@@ -501,7 +525,11 @@ export default function MortgageCompare() {
           <div>
             <AlertBanner alerts={alerts} />
 
-            <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 8 }}>
+              <div style={{ display: "flex", gap: 8 }}>
+                {quotes.length < 4 && <button onClick={() => { handleAdd(); setTab("detailed"); }} style={{ padding: "10px 22px", borderRadius: 10, border: `2px dashed ${T.border}`, background: "rgba(255,255,255,0.5)", cursor: "pointer", fontSize: 12, fontWeight: 600, color: T.textMid }}>+ Add Quote ({quotes.length}/4)</button>}
+                <button onClick={() => setTab("detailed")} style={{ padding: "10px 22px", borderRadius: 10, border: `1px solid ${T.border}`, background: T.white, cursor: "pointer", fontSize: 12, fontWeight: 600, color: T.textMid }}>✏️ Edit Details</button>
+              </div>
               <button onClick={() => { const w = window.open("", "_blank"); w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>MortgageCompare Report</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Georgia,serif;background:#FDFCF7;color:#1A1A1A;padding:24px}.c{max-width:800px;margin:0 auto;background:#fff;border-radius:16px;padding:36px;box-shadow:0 2px 12px rgba(0,0,0,0.08)}h1{font-size:26px;color:${T.green}}h2{font-size:18px;margin:28px 0 12px;color:${T.green};border-bottom:2px solid ${T.gold};padding-bottom:6px}.sub{color:${T.textLight};font-size:12px;margin-bottom:24px}.w{background:${best.color.grad};color:#fff;border-radius:14px;padding:24px;margin:20px 0}.w h3{font-size:22px;font-weight:400;margin:4px 0}.w .s{display:flex;gap:24px;margin-top:14px;flex-wrap:wrap}.w .sl{font-size:9px;text-transform:uppercase;opacity:0.6}.w .sv{font-size:17px;font-family:monospace;margin-top:2px}.q{border:1px solid ${T.border};border-radius:12px;padding:16px;margin:10px 0}.q b{font-size:14px}table{width:100%;border-collapse:collapse;font-size:12px;margin:10px 0}th{text-align:left;padding:8px;border-bottom:2px solid ${T.border};font-size:10px;text-transform:uppercase;color:${T.textLight}}td{padding:8px;border-bottom:1px solid #f3f4f6}.ft{font-size:11px;color:${T.textLight};margin-top:24px;padding-top:12px;border-top:1px solid ${T.border}}</style></head><body><div class="c"><h1>⚖️ MortgageCompare Report</h1><div class="sub">${new Date().toLocaleDateString("en-US",{weekday:"long",year:"numeric",month:"long",day:"numeric"})} · ${horizon}-year horizon</div><div class="w"><div style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;opacity:0.6">★ Best Value</div><h3>${best.name}</h3>${best.officer?`<div style="font-size:13px;opacity:0.7">with ${best.officer}</div>`:""}<div class="s">${[["Rate",best.rate+"%"],["P&I",fmt2(best.pi)+"/mo"],["Lender-Controlled",fmt(best.lc)],["Total ("+horizon+"yr)",fmt(best.tc)]].map(([l,v])=>`<div><div class="sl">${l}</div><div class="sv">${v}</div></div>`).join("")}</div></div><h2>All Quotes</h2>${analysis.map(a=>`<div class="q" style="border-left:4px solid ${a.color.bg}"><b style="color:${a.color.bg}">${a.name} — ${a.rate}%</b>${a.officer?`<div style="font-size:12px;color:${T.textLight}">${a.officer}</div>`:""}<div style="display:flex;flex-wrap:wrap;gap:16px;margin-top:8px;font-size:13px"><div>P&I: <b>${fmt2(a.pi)}/mo</b></div><div>Lender Fees: ${fmt(a.lf)}</div><div>Points: ${fmt(a.pts)}</div><div>Lender Total: <b>${fmt(a.lc)}</b></div><div>Total ${horizon}yr: <b>${fmt(a.tc)}</b></div></div></div>`).join("")}<h2>Cost Over Time</h2><table><thead><tr><th>Horizon</th>${analysis.map(a=>`<th style="text-align:right;color:${a.color.bg}">${a.rate}%</th>`).join("")}</tr></thead><tbody>${[3,5,7,10,15].map(yr=>{const costs=analysis.map(a=>a.lc+a.pi*yr*12);const mn=Math.min(...costs);return`<tr${yr===horizon?' style="background:#FEF9EF;font-weight:700"':""}><td>${yr} yr${yr===horizon?" ←":""}</td>${costs.map((c,j)=>`<td style="text-align:right;font-family:monospace;${c===mn?"color:#059669;font-weight:700":""}">${fmt(c)}${c===mn?" ✓":""}</td>`).join("")}</tr>`}).join("")}</tbody></table><div class="ft">Estimates only. Get official Loan Estimates before choosing. Not affiliated with any lender.</div></div></body></html>`); w.document.close(); }} style={{ padding: "10px 22px", borderRadius: 10, border: `1px solid ${T.border}`, background: T.white, cursor: "pointer", fontSize: 12, fontWeight: 600, color: T.textMid, transition: "all 0.2s" }}>📄 Export Report</button>
             </div>
 
@@ -609,7 +637,16 @@ export default function MortgageCompare() {
 
             {/* Breakeven */}
             <div className="fade-up glass-card" style={{ animationDelay: "0.25s", borderRadius: 24, padding: "32px 36px", marginBottom: 24 }}>
-              <div style={{ fontSize: 26, fontFamily: "var(--heading)", color: T.green, marginBottom: 18 }}>Breakeven Analysis</div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 18 }}>
+                <div style={{ fontSize: 26, fontFamily: "var(--heading)", color: T.green }}>Breakeven Analysis</div>
+                <button onClick={() => setShowBreakevenInfo(prev => !prev)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${T.border}`, background: T.cream, cursor: "pointer", fontSize: 11, color: T.textMid, fontWeight: 600, whiteSpace: "nowrap" }}>{showBreakevenInfo ? "Hide Info ▲" : "What's This? ▼"}</button>
+              </div>
+              {showBreakevenInfo && <div style={{ padding: "16px 20px", background: `linear-gradient(135deg, ${T.goldPale}, rgba(253,248,232,0.5))`, borderRadius: 14, marginBottom: 18, fontSize: 13, lineHeight: 1.8, color: T.textMid, border: `1px solid ${T.gold}22` }}>
+                <div style={{ fontWeight: 700, color: T.green, marginBottom: 6, fontFamily: "var(--heading)", fontSize: 15 }}>How Breakeven Works</div>
+                <p style={{ marginBottom: 8 }}>When you buy down your interest rate by paying more in discount points, you get a lower monthly payment — but you pay more upfront. The <strong>breakeven point</strong> is how long it takes for those monthly savings to "pay back" the extra upfront cost.</p>
+                <p style={{ marginBottom: 8 }}>For example, if paying an extra $3,000 in points saves you $50/month, your breakeven is 60 months (5 years). If you stay in the home longer than 5 years, the buydown was worth it. If you sell or refinance sooner, you lost money on the deal.</p>
+                <p>The <strong style={{ color: T.success }}>✓ Recovers in time</strong> label means the breakeven happens before your selected time horizon. <strong style={{ color: T.danger }}>✗ Doesn't recover</strong> means it doesn't pay off within your horizon — the higher rate may actually be the better deal for your situation.</p>
+              </div>}
               <div className="resp-flex" style={{ display: "flex", gap: 10, marginBottom: 20 }}>
                 {analysis.map(a => {
                   if (!baseline || a.rate === baseRate) return <div key={a.i} style={{ flex: 1, padding: 16, background: T.warmGray, borderRadius: 14, textAlign: "center" }}><div style={{ fontSize: 15, fontWeight: 600, color: a.color.bg }}>{a.rate}%</div><div style={{ fontSize: 11, color: T.textLight }}>Baseline</div></div>;
