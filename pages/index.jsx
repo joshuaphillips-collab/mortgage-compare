@@ -61,13 +61,43 @@ function detectAlerts(quotes) {
   if (la.length > 1) alerts.push({ type: "critical", title: "Loan Amounts Don't Match", detail: `Quotes show different loan amounts (${la.map(fmt).join(" vs ")}). Direct comparison may be misleading.` });
   const hv = valid.map(q => ({ name: q.lenderName, val: num(q.homeownersInsAnnual) })).filter(h => h.val > 0);
   if (hv.length >= 2) { const s = [...hv].sort((a, b) => a.val - b.val); if ((s[s.length - 1].val - s[0].val) / s[s.length - 1].val > 0.2) alerts.push({ type: "warning", title: "Hazard Insurance Estimates Differ", detail: `${s[0].name} estimates ${fmt(s[0].val)}/yr vs ${s[s.length - 1].name} at ${fmt(s[s.length - 1].val)}/yr. The actual cost depends on the policy you choose — not the lender.` }); }
-  valid.forEach(q => {
+
+  // Deduplicate credit alerts: group by lender+type+amount
+  const seen = new Set();
+  const creditAlert = (type, q, field, title, detail) => {
+    const val = num(q[field]); if (val <= 0) return;
     const name = q.lenderName || "A lender";
-    if (num(q.lenderCredit) > 0) alerts.push({ type: "info", title: `${name} — Lender Credit of ${fmt(num(q.lenderCredit))}`, detail: `This lender credit has been subtracted from their points/origination, reducing their lender-controlled total.` });
-    if (num(q.sellerCredit) > 0) alerts.push({ type: "info", title: `${name} — Seller Credit of ${fmt(num(q.sellerCredit))} Noted`, detail: `Seller credits reduce cash to close but are not a lender cost. Excluded from the comparison.` });
-    if (num(q.unknownCredit) > 0) alerts.push({ type: "warning", title: `${name} — Unidentified Credit of ${fmt(num(q.unknownCredit))}`, detail: `A credit was found but the source wasn't clear. We're treating it as a seller credit. If it's a lender credit, move it to "Lender Credit" in the Detail tab.` });
-    if (num(q.earnestMoney) > 0) alerts.push({ type: "info", title: `${name} — Earnest Money of ${fmt(num(q.earnestMoney))}`, detail: `Your deposit toward the purchase. Reduces cash at closing but is not a lender fee.` });
-    if (num(q.loanOriginationFee) > 0 && num(q.discountPoints) > 0) alerts.push({ type: "info", title: `${name} charges origination fee + points`, detail: `Origination (${fmt(num(q.loanOriginationFee))}) grouped with discount points (${fmt(num(q.discountPoints))}). Combined: ${fmt(num(q.loanOriginationFee) + num(q.discountPoints))}.` });
+    const rate = num(q.rate);
+    // Check if same lender already has same type and same amount
+    const key = `${name}|${field}|${val}`;
+    if (seen.has(key)) return; // exact duplicate — skip
+    // Check if same lender has same type but different amount
+    const lenderTypeKey = `${name}|${field}`;
+    const hasDiffAmount = valid.some(other => other !== q && (other.lenderName || "A lender") === name && num(other[field]) > 0 && num(other[field]) !== val);
+    const label = hasDiffAmount ? `${name} (${rate}%)` : name;
+    seen.add(key);
+    alerts.push({ type, title: title(label, val), detail: detail(label, val) });
+  };
+
+  valid.forEach(q => {
+    creditAlert("info", q, "lenderCredit",
+      (n, v) => `${n} — Lender Credit of ${fmt(v)}`,
+      (n, v) => `This lender credit has been subtracted from their points/origination, reducing their lender-controlled total.`);
+    creditAlert("info", q, "sellerCredit",
+      (n, v) => `${n} — Seller Credit of ${fmt(v)} Noted`,
+      (n, v) => `Seller credits reduce cash to close but are not a lender cost. Excluded from the comparison.`);
+    creditAlert("warning", q, "unknownCredit",
+      (n, v) => `${n} — Unidentified Credit of ${fmt(v)}`,
+      (n, v) => `A credit was found but the source wasn't clear. We're treating it as a seller credit. If it's a lender credit, move it to "Lender Credit" in the Detail tab.`);
+    creditAlert("info", q, "earnestMoney",
+      (n, v) => `${n} — Earnest Money of ${fmt(v)}`,
+      (n, v) => `Your deposit toward the purchase. Reduces cash at closing but is not a lender fee.`);
+    // Origination + points (dedupe by lender)
+    const name = q.lenderName || "A lender";
+    if (num(q.loanOriginationFee) > 0 && num(q.discountPoints) > 0) {
+      const origKey = `${name}|origpoints|${num(q.loanOriginationFee)}|${num(q.discountPoints)}`;
+      if (!seen.has(origKey)) { seen.add(origKey); alerts.push({ type: "info", title: `${name} charges origination fee + points`, detail: `Origination (${fmt(num(q.loanOriginationFee))}) grouped with discount points (${fmt(num(q.discountPoints))}). Combined: ${fmt(num(q.loanOriginationFee) + num(q.discountPoints))}.` }); }
+    }
   });
   return alerts;
 }
@@ -92,55 +122,44 @@ async function extractFromDocument(file) {
   return JSON.parse(text);
 }
 
-// ─── Reputation Lookup (with better error handling) ───
+// ─── Reputation Lookup (no web_search tool — uses training knowledge) ───
 async function lookupReputation(officer, lender) {
-  const sysPrompt = `You are researching a loan officer's online reputation.
+  // Generate fuzzy company name variations
+  const variations = [lender];
+  if (lender.includes("Corporation")) variations.push(lender.replace(" Corporation", ""));
+  else if (!lender.includes("Corporation")) variations.push(lender + " Corporation");
+  if (lender.includes("Mortgage")) variations.push(lender.replace(" Mortgage", "").replace(" Corporation", ""));
+  const lenderNames = [...new Set(variations)].join('" or "');
 
-Search for: "${officer}" at "${lender}"
-Check: Birdeye.com (primary — often has hundreds of reviews), the lender's website, Google reviews, Zillow, LendingTree, SocialSurvey.
+  try {
+    const resp = await fetch(API, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1500,
+        system: `You are a mortgage industry research assistant. The user wants to know about a loan officer's reputation. Use your training knowledge to provide what you know.
 
-Return ONLY a JSON object (no markdown, no backticks):
-{"rating":4.9,"reviewCount":671,"summary":"2-3 sentence summary","highlights":["theme 1","theme 2"],"concerns":[],"sources":["Birdeye (671 reviews)","Google (15 reviews)"]}
+IMPORTANT: The company may be referred to by slightly different names. Check for: "${lenderNames}"
 
-If you cannot find info: {"rating":0,"reviewCount":0,"summary":"No reviews found online. Try birdeye.com directly.","highlights":[],"concerns":[],"sources":[]}`;
+Provide your best assessment based on what you know from your training data about this person and their company. If you know specific review counts or ratings from Birdeye, Google, Zillow, or other platforms, include them. If you know about the company's general reputation, include that too.
 
-  const userMsg = `Research the online reputation of loan officer ${officer} at ${lender}. Search Birdeye first, then the lender website, then Google/Zillow. Report total reviews and rating.`;
+You MUST return ONLY a valid JSON object (no markdown, no backticks, no explanation before or after):
+{"rating":4.5,"reviewCount":100,"summary":"2-3 sentence summary of what you know","highlights":["positive theme 1","positive theme 2"],"concerns":[],"sources":["platforms where reviews exist"]}
 
-  const parseResponse = (data) => {
-    const textParts = (data.content || []).filter(b => b.type === "text").map(b => b.text);
-    const fullText = textParts.join("\n");
+If you have absolutely no information about this person, return:
+{"rating":0,"reviewCount":0,"summary":"No information found in training data for this loan officer. Visit birdeye.com and search their name for the most complete review data.","highlights":[],"concerns":[],"sources":[]}`,
+        messages: [{ role: "user", content: `What do you know about the reputation of loan officer ${officer} who works at ${lender}? Check for any variation of the company name (${lenderNames}). Include any review data you know from Birdeye, Google, Zillow, the company website, or any other source.` }]
+      }) });
+    if (!resp.ok) return { rating: 0, reviewCount: 0, summary: `Could not connect (HTTP ${resp.status}). Try refreshing the page.`, highlights: [], concerns: [], sources: [], _failed: true };
+    const data = await resp.json();
+    if (data.error) return { rating: 0, reviewCount: 0, summary: "API error: " + (data.error.message || "Unknown error"), highlights: [], concerns: [], sources: [], _failed: true };
+    const fullText = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n");
     const jsonMatch = fullText.match(/\{[\s\S]*?"rating"[\s\S]*?\}/);
     if (jsonMatch) {
-      try { return JSON.parse(jsonMatch[0]); } catch {}
+      try {
+        const result = JSON.parse(jsonMatch[0]);
+        if (result.reviewCount > 0) result.summary = (result.summary || "") + " (Based on training data — for the most current reviews, visit birdeye.com)";
+        return result;
+      } catch {}
     }
-    return null;
-  };
-
-  // Attempt 1: with web_search tool (best results)
-  try {
-    const resp = await fetch(API, { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 2000, system: sysPrompt,
-        messages: [{ role: "user", content: userMsg }],
-        tools: [{ type: "web_search_20250305", name: "web_search" }] }) });
-    if (resp.ok) {
-      const data = await resp.json();
-      if (data.error) throw new Error(data.error.message || "API error");
-      const result = parseResponse(data);
-      if (result) return result;
-    }
-  } catch (e) { /* fall through to attempt 2 */ }
-
-  // Attempt 2: without tools (uses training knowledge only)
-  try {
-    const resp = await fetch(API, { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1500, system: sysPrompt,
-        messages: [{ role: "user", content: userMsg + "\n\nNote: Web search is unavailable. Use your training knowledge about this person if you have any. If you have no information, say so honestly." }] }) });
-    if (!resp.ok) return { rating: 0, reviewCount: 0, summary: "Could not connect to the AI service. Check that the API key is configured correctly in Vercel.", highlights: [], concerns: [], sources: [], _failed: true };
-    const data = await resp.json();
-    if (data.error) return { rating: 0, reviewCount: 0, summary: "API error: " + (data.error.message || "Unknown"), highlights: [], concerns: [], sources: [], _failed: true };
-    const result = parseResponse(data);
-    if (result) { result.summary = (result.summary || "") + " (Note: Based on training data — live search unavailable. Results may not reflect current reviews.)"; return result; }
-    return { rating: 0, reviewCount: 0, summary: "Could not find information. Try searching birdeye.com directly.", highlights: [], concerns: [], sources: [], _failed: true };
+    return { rating: 0, reviewCount: 0, summary: "Could not parse response. Visit birdeye.com to look up this loan officer directly.", highlights: [], concerns: [], sources: [], _failed: true };
   } catch (e) {
     return { rating: 0, reviewCount: 0, summary: "Connection error: " + (e.message || "Unknown"), highlights: [], concerns: [], sources: [], _failed: true };
   }
@@ -386,8 +405,11 @@ export default function MortgageCompare() {
   };
   // Sequential lookup - looks up all officers one at a time
   const handleLookupAll = async () => {
+    // Deduplicate by lender — one lookup per company
+    const seen = new Set();
     for (const a of analysis) {
-      if (a.officer) {
+      if (a.officer && !seen.has(a.name)) {
+        seen.add(a.name);
         const key = `${a.officer}|${a.name}`;
         if (!reps[key] || reps[key]._failed) {
           await handleLookupRep(a.officer, a.name);
@@ -599,24 +621,35 @@ export default function MortgageCompare() {
               ))}
             </div>
 
-            {/* Reputation */}
+            {/* Reputation — deduplicated by company */}
+            {(() => {
+              // Group by lender name — one card per unique company
+              const lenderMap = {};
+              analysis.forEach(a => {
+                const ln = (a.name || "").trim();
+                if (!lenderMap[ln]) lenderMap[ln] = { name: ln, officer: a.officer, color: a.color, indices: [a.i] };
+                else { lenderMap[ln].indices.push(a.i); if (!lenderMap[ln].officer && a.officer) lenderMap[ln].officer = a.officer; }
+              });
+              const uniqueLenders = Object.values(lenderMap);
+              return (
             <div className="fade-up glass-card" style={{ animationDelay: "0.15s", borderRadius: 24, padding: "32px 36px", marginBottom: 24 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 18, flexWrap: "wrap", gap: 10 }}>
                 <div>
                   <div style={{ fontSize: 26, fontFamily: "var(--heading)", color: T.green, marginBottom: 4 }}>Loan Officer Reputation</div>
-                  <div style={{ fontSize: 14, color: T.textLight }}>Reviews from Birdeye, Google, and more — looked up one at a time</div>
+                  <div style={{ fontSize: 14, color: T.textLight }}>One lookup per lender · For the most current data, visit <a href="https://birdeye.com" target="_blank" rel="noopener" style={{ color: T.green }}>birdeye.com</a></div>
                 </div>
-                {analysis.filter(a => a.officer).length >= 2 && <button onClick={handleLookupAll} disabled={Object.values(repLoading).some(v => v)} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: Object.values(repLoading).some(v => v) ? T.warmGray : `linear-gradient(135deg, ${T.green}, ${T.greenLight})`, color: Object.values(repLoading).some(v => v) ? T.textLight : "#fff", cursor: "pointer", fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", boxShadow: `0 2px 8px ${T.green}22` }}>{Object.values(repLoading).some(v => v) ? "Searching..." : "⭐ Look Up All"}</button>}
+                {uniqueLenders.filter(l => l.officer).length >= 2 && <button onClick={handleLookupAll} disabled={Object.values(repLoading).some(v => v)} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: Object.values(repLoading).some(v => v) ? T.warmGray : `linear-gradient(135deg, ${T.green}, ${T.greenLight})`, color: Object.values(repLoading).some(v => v) ? T.textLight : "#fff", cursor: "pointer", fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", boxShadow: `0 2px 8px ${T.green}22` }}>{Object.values(repLoading).some(v => v) ? "Searching..." : "⭐ Look Up All"}</button>}
               </div>
-              <div className="resp-grid" style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(analysis.length, 2)}, 1fr)`, gap: 14 }}>
-                {analysis.map(a => { const key = `${a.officer}|${a.name}`; const rep = reps[key]; const isLoading = repLoading[key]; const failed = rep && rep._failed; return (
-                  <div key={a.i} style={{ padding: 18, background: T.warmGray, borderRadius: 16, borderLeft: `5px solid ${a.color.bg}` }}>
-                    <div style={{ fontSize: 15, fontWeight: 700, color: a.color.bg, fontFamily: "var(--heading)", marginBottom: 10 }}>{a.name}</div>
+              <div className="resp-grid" style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(uniqueLenders.length, 2)}, 1fr)`, gap: 14 }}>
+                {uniqueLenders.map((l, li) => { const key = `${l.officer}|${l.name}`; const rep = reps[key]; const isLoading = repLoading[key]; const failed = rep && rep._failed; return (
+                  <div key={li} style={{ padding: 18, background: T.warmGray, borderRadius: 16, borderLeft: `5px solid ${l.color.bg}` }}>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: l.color.bg, fontFamily: "var(--heading)", marginBottom: 4 }}>{l.name}</div>
+                    {l.indices.length > 1 && <div style={{ fontSize: 10, color: T.textLight, marginBottom: 8 }}>{l.indices.length} quotes from this lender</div>}
                     <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10 }}>
-                      <input type="text" value={a.officer} onChange={e => handleEditOfficer(a.i, e.target.value)} placeholder="Enter loan officer name..." style={{ flex: 1, padding: "10px 14px", borderRadius: 10, border: `1px solid ${T.border}`, fontSize: 13, outline: "none", background: T.white, fontFamily: "var(--body)" }} />
-                      {a.officer && (!rep || failed) && <button onClick={() => handleLookupRep(a.officer, a.name)} disabled={isLoading} style={{ padding: "10px 18px", borderRadius: 10, border: "none", background: isLoading ? T.warmGray : `linear-gradient(135deg, ${T.green}, ${T.greenLight})`, color: isLoading ? T.textLight : "#fff", cursor: isLoading ? "wait" : "pointer", fontSize: 11, whiteSpace: "nowrap", fontWeight: 600, boxShadow: isLoading ? "none" : `0 2px 8px ${T.green}33` }}>{isLoading ? "Searching..." : failed ? "🔄 Retry" : "⭐ Look up"}</button>}
+                      <input type="text" value={l.officer} onChange={e => { const newName = e.target.value; l.indices.forEach(idx => { const valid = quotes.filter(q => num(q.loanAmount) > 0 && num(q.rate) > 0); const qi = valid[idx]; if (qi) { const realIdx = quotes.indexOf(qi); if (realIdx >= 0) setQuotes(prev => { const q = [...prev]; q[realIdx] = { ...q[realIdx], loanOfficer: newName }; return q; }); } }); }} placeholder="Enter loan officer name..." style={{ flex: 1, padding: "10px 14px", borderRadius: 10, border: `1px solid ${T.border}`, fontSize: 13, outline: "none", background: T.white, fontFamily: "var(--body)" }} />
+                      {l.officer && (!rep || failed) && <button onClick={() => handleLookupRep(l.officer, l.name)} disabled={isLoading} style={{ padding: "10px 18px", borderRadius: 10, border: "none", background: isLoading ? T.warmGray : `linear-gradient(135deg, ${T.green}, ${T.greenLight})`, color: isLoading ? T.textLight : "#fff", cursor: isLoading ? "wait" : "pointer", fontSize: 11, whiteSpace: "nowrap", fontWeight: 600, boxShadow: isLoading ? "none" : `0 2px 8px ${T.green}33` }}>{isLoading ? "Searching..." : failed ? "🔄 Retry" : "⭐ Look up"}</button>}
                     </div>
-                    {isLoading && <div style={{ padding: 10, fontSize: 12, color: T.textLight, textAlign: "center" }}><span className="spin">⏳</span> Searching Birdeye, Google, and more... this takes a moment</div>}
+                    {isLoading && <div style={{ padding: 10, fontSize: 12, color: T.textLight, textAlign: "center" }}><span className="spin">⏳</span> Looking up reputation...</div>}
                     {rep && !failed && <div style={{ padding: 14, background: T.white, borderRadius: 12 }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
                         {rep.rating > 0 && <span style={{ fontSize: 28, fontWeight: 700, fontFamily: "var(--mono)", color: T.green }}>{rep.rating.toFixed(1)}</span>}
@@ -630,7 +663,8 @@ export default function MortgageCompare() {
                   </div>);
                 })}
               </div>
-            </div>
+            </div>);
+            })()}
 
             {/* AI Chat */}
             <div className="fade-up" style={{ animationDelay: "0.2s", marginBottom: 24 }}><AIChat analysis={analysis} horizon={horizon} /></div>
