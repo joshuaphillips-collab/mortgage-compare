@@ -122,29 +122,32 @@ async function extractFromDocument(file) {
   return JSON.parse(text);
 }
 
-// ─── Reputation Lookup — same API pattern as working chat (no tools) ───
+// ─── Reputation Lookup — web search enabled ───
 async function lookupReputation(officer, lender) {
   const shortLender = lender.replace(/ Corporation$/i, "").replace(/ Company$/i, "").replace(/ Inc\.?$/i, "");
-  const sys = "You are a helpful assistant that provides information about loan officers. Return ONLY valid JSON with no other text.";
-  const msg = `Tell me what you know about loan officer ${officer} at ${lender} (also called ${shortLender}). Include their review ratings, approximate review counts, and which platforms have reviews (Birdeye, Google, Zillow, Yelp, company website, etc).
-
-Format your response as ONLY this JSON structure, nothing else before or after:
-{"rating":4.5,"reviewCount":100,"summary":"What you know about them","highlights":["strength1","strength2"],"concerns":[],"sources":["Platform1","Platform2"]}`;
-
+  const sys = `Search the web for loan officer reviews then return ONLY valid JSON. Search for: "${officer} ${shortLender} reviews", "${officer} ${lender} reviews", and "${officer} loan officer birdeye". Birdeye.com usually has the most reviews. Also check Google, Zillow, Yelp, and the lender website. Return: {"rating":4.9,"reviewCount":671,"summary":"2-3 sentences","highlights":["theme1","theme2"],"concerns":[],"sources":["Birdeye (671 reviews)","Google (15 reviews)"]}. If not found: {"rating":0,"reviewCount":0,"summary":"No reviews found.","highlights":[],"concerns":[],"sources":[]}`;
+  const msg = `Search for reviews of loan officer ${officer} at ${lender} (also known as ${shortLender}). Find their Birdeye profile, Google reviews, and any other review platforms. Report the total reviews and rating.`;
   try {
     const res = await fetch(API, { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 800, system: sys, messages: [{ role: "user", content: msg }] }) });
-    if (!res.ok) throw new Error("API " + res.status);
+      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 2000, system: sys,
+        messages: [{ role: "user", content: msg }],
+        tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }]
+      }) });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "no body");
+      return { rating: 0, reviewCount: 0, summary: `API returned HTTP ${res.status}. Detail: ${errBody.slice(0, 200)}`, highlights: [], concerns: [], sources: [], _failed: true };
+    }
     const data = await res.json();
+    if (data.error) return { rating: 0, reviewCount: 0, summary: "API error: " + JSON.stringify(data.error).slice(0, 200), highlights: [], concerns: [], sources: [], _failed: true };
     const text = (data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "").replace(/```json|```/g, "").trim();
-    if (!text) return { rating: 0, reviewCount: 0, summary: "Empty response. Try again.", highlights: [], concerns: [], sources: [], _failed: true };
+    if (!text) return { rating: 0, reviewCount: 0, summary: "Search ran but returned no text. Content types: " + (data.content?.map(b => b.type).join(", ") || "none"), highlights: [], concerns: [], sources: [], _failed: true };
     try { return JSON.parse(text); } catch {
       const m = text.match(/\{[\s\S]*?"rating"[\s\S]*?\}/);
       if (m) { try { return JSON.parse(m[0]); } catch {} }
-      return { rating: 0, reviewCount: 0, summary: "Could not parse. Response: " + text.slice(0, 100), highlights: [], concerns: [], sources: [], _failed: true };
+      return { rating: 0, reviewCount: 0, summary: "Parse failed. Raw text: " + text.slice(0, 150), highlights: [], concerns: [], sources: [], _failed: true };
     }
   } catch (e) {
-    return { rating: 0, reviewCount: 0, summary: "Error: " + (e.message || "Unknown"), highlights: [], concerns: [], sources: [], _failed: true };
+    return { rating: 0, reviewCount: 0, summary: "Network error: " + (e.message || "Unknown"), highlights: [], concerns: [], sources: [], _failed: true };
   }
 }
 
