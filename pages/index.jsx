@@ -129,7 +129,7 @@ async function lookupReputation(officer, lender) {
   const msg = `Search for reviews of loan officer ${officer} at ${lender} (also known as ${shortLender}). Find their Birdeye profile, Google reviews, and any other review platforms. Report the total reviews and rating.`;
   try {
     const res = await fetch(API, { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 2000, system: sys,
+      body: JSON.stringify({ model: "claude-sonnet-4-5-20250929", max_tokens: 2000, system: sys,
         messages: [{ role: "user", content: msg }],
         tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }]
       }) });
