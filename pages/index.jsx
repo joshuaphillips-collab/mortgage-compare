@@ -122,30 +122,45 @@ async function extractFromDocument(file) {
   return JSON.parse(text);
 }
 
-// ─── Reputation Lookup — matches working extraction/chat API pattern exactly ───
+// ─── Reputation Lookup — uses web_search for live data ───
 async function lookupReputation(officer, lender) {
   const shortLender = lender.replace(/ Corporation$/i, "").replace(/ Company$/i, "").replace(/ Inc\.?$/i, "");
-  const prompt = `What do you know about loan officer ${officer} at ${lender} (also known as ${shortLender})? Include review ratings, review counts, and review sources (Birdeye, Google, Zillow, company website). Return ONLY valid JSON, nothing else: {"rating":4.5,"reviewCount":100,"summary":"summary text","highlights":["theme1","theme2"],"concerns":[],"sources":["source1"]}. If unknown return: {"rating":0,"reviewCount":0,"summary":"No data found. Visit birdeye.com to search.","highlights":[],"concerns":[],"sources":[]}`;
   try {
     const resp = await fetch(API, { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 800, messages: [{ role: "user", content: prompt }] }) });
+      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 2000,
+        system: `You research loan officer reputations. Search the web for reviews, then return ONLY a JSON object.
+
+SEARCH STRATEGY — do ALL of these searches:
+1. "${officer} ${shortLender} reviews" — finds Birdeye, Google, Zillow results
+2. "${officer} ${lender} reviews" — catches exact company name matches
+3. "${officer} loan officer reviews" — broader search for any platform
+
+IMPORTANT: Birdeye.com often has hundreds of reviews for loan officers. Google may only show 10-20. Always report the HIGHEST review count you find and note which platform it's from.
+
+Also check: churchillmortgage.com, zillow.com, lendingtree.com, google reviews, yelp, socialsurvey.
+
+Return ONLY valid JSON (no markdown, no backticks, no other text):
+{"rating":4.9,"reviewCount":671,"summary":"2-3 sentence summary","highlights":["theme 1","theme 2","theme 3"],"concerns":[],"sources":["Birdeye (671 reviews, 4.9★)","Google (15 reviews)","Company website"]}
+
+If you truly cannot find this person after searching: {"rating":0,"reviewCount":0,"summary":"No reviews found after searching. Try googling their name + reviews.","highlights":[],"concerns":[],"sources":[]}`,
+        messages: [{ role: "user", content: `Search for reviews of loan officer ${officer} at ${lender} (also known as ${shortLender}). Check Birdeye, Google, the company website, Zillow, Yelp, and any other review platforms. Report total reviews across all platforms.` }],
+        tools: [{ type: "web_search_20250305", name: "web_search" }]
+      }) });
     if (!resp.ok) {
       const errText = await resp.text().catch(() => "");
-      return { rating: 0, reviewCount: 0, summary: `HTTP ${resp.status}: ${errText.slice(0, 120) || "Connection failed"}. Extraction works, so this may be a temporary issue — try again.`, highlights: [], concerns: [], sources: [], _failed: true };
+      return { rating: 0, reviewCount: 0, summary: `HTTP ${resp.status}: ${errText.slice(0, 150) || "Connection failed"}.`, highlights: [], concerns: [], sources: [], _failed: true };
     }
     const data = await resp.json();
     if (data.error) return { rating: 0, reviewCount: 0, summary: "API error: " + (data.error.message || JSON.stringify(data.error)).slice(0, 150), highlights: [], concerns: [], sources: [], _failed: true };
-    const text = (data.content?.map(b => b.text || "").join("") || "").replace(/```json|```/g, "").trim();
-    if (!text) return { rating: 0, reviewCount: 0, summary: "Empty response from AI. Try again.", highlights: [], concerns: [], sources: [], _failed: true };
+    const text = (data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "").replace(/```json|```/g, "").trim();
+    if (!text) return { rating: 0, reviewCount: 0, summary: "Search completed but got empty response. Try again.", highlights: [], concerns: [], sources: [], _failed: true };
     try {
       const result = JSON.parse(text);
-      if (result.reviewCount > 0) result.summary = (result.summary || "") + " (Training data — visit birdeye.com for current reviews)";
       return result;
     } catch {
-      // Try to extract JSON from mixed text
       const m = text.match(/\{[\s\S]*?"rating"[\s\S]*?\}/);
-      if (m) { try { const r = JSON.parse(m[0]); if (r.reviewCount > 0) r.summary = (r.summary || "") + " (Training data)"; return r; } catch {} }
-      return { rating: 0, reviewCount: 0, summary: "Got response but couldn't parse it. Response started with: " + text.slice(0, 80), highlights: [], concerns: [], sources: [], _failed: true };
+      if (m) { try { return JSON.parse(m[0]); } catch {} }
+      return { rating: 0, reviewCount: 0, summary: "Couldn't parse results. Raw: " + text.slice(0, 100), highlights: [], concerns: [], sources: [], _failed: true };
     }
   } catch (e) {
     return { rating: 0, reviewCount: 0, summary: "Network error: " + (e.message || "Unknown"), highlights: [], concerns: [], sources: [], _failed: true };
