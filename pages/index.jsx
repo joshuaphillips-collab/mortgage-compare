@@ -122,46 +122,33 @@ async function extractFromDocument(file) {
   return JSON.parse(text);
 }
 
-// ─── Reputation Lookup (no web_search tool — uses training knowledge) ───
+// ─── Reputation Lookup — matches working extraction/chat API pattern exactly ───
 async function lookupReputation(officer, lender) {
-  // Generate fuzzy company name variations
-  const variations = [lender];
-  if (lender.includes("Corporation")) variations.push(lender.replace(" Corporation", ""));
-  else if (!lender.includes("Corporation")) variations.push(lender + " Corporation");
-  if (lender.includes("Mortgage")) variations.push(lender.replace(" Mortgage", "").replace(" Corporation", ""));
-  const lenderNames = [...new Set(variations)].join('" or "');
-
+  const shortLender = lender.replace(/ Corporation$/i, "").replace(/ Company$/i, "").replace(/ Inc\.?$/i, "");
+  const prompt = `What do you know about loan officer ${officer} at ${lender} (also known as ${shortLender})? Include review ratings, review counts, and review sources (Birdeye, Google, Zillow, company website). Return ONLY valid JSON, nothing else: {"rating":4.5,"reviewCount":100,"summary":"summary text","highlights":["theme1","theme2"],"concerns":[],"sources":["source1"]}. If unknown return: {"rating":0,"reviewCount":0,"summary":"No data found. Visit birdeye.com to search.","highlights":[],"concerns":[],"sources":[]}`;
   try {
     const resp = await fetch(API, { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1500,
-        system: `You are a mortgage industry research assistant. The user wants to know about a loan officer's reputation. Use your training knowledge to provide what you know.
-
-IMPORTANT: The company may be referred to by slightly different names. Check for: "${lenderNames}"
-
-Provide your best assessment based on what you know from your training data about this person and their company. If you know specific review counts or ratings from Birdeye, Google, Zillow, or other platforms, include them. If you know about the company's general reputation, include that too.
-
-You MUST return ONLY a valid JSON object (no markdown, no backticks, no explanation before or after):
-{"rating":4.5,"reviewCount":100,"summary":"2-3 sentence summary of what you know","highlights":["positive theme 1","positive theme 2"],"concerns":[],"sources":["platforms where reviews exist"]}
-
-If you have absolutely no information about this person, return:
-{"rating":0,"reviewCount":0,"summary":"No information found in training data for this loan officer. Visit birdeye.com and search their name for the most complete review data.","highlights":[],"concerns":[],"sources":[]}`,
-        messages: [{ role: "user", content: `What do you know about the reputation of loan officer ${officer} who works at ${lender}? Check for any variation of the company name (${lenderNames}). Include any review data you know from Birdeye, Google, Zillow, the company website, or any other source.` }]
-      }) });
-    if (!resp.ok) return { rating: 0, reviewCount: 0, summary: `Could not connect (HTTP ${resp.status}). Try refreshing the page.`, highlights: [], concerns: [], sources: [], _failed: true };
-    const data = await resp.json();
-    if (data.error) return { rating: 0, reviewCount: 0, summary: "API error: " + (data.error.message || "Unknown error"), highlights: [], concerns: [], sources: [], _failed: true };
-    const fullText = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n");
-    const jsonMatch = fullText.match(/\{[\s\S]*?"rating"[\s\S]*?\}/);
-    if (jsonMatch) {
-      try {
-        const result = JSON.parse(jsonMatch[0]);
-        if (result.reviewCount > 0) result.summary = (result.summary || "") + " (Based on training data — for the most current reviews, visit birdeye.com)";
-        return result;
-      } catch {}
+      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 800, messages: [{ role: "user", content: prompt }] }) });
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => "");
+      return { rating: 0, reviewCount: 0, summary: `HTTP ${resp.status}: ${errText.slice(0, 120) || "Connection failed"}. Extraction works, so this may be a temporary issue — try again.`, highlights: [], concerns: [], sources: [], _failed: true };
     }
-    return { rating: 0, reviewCount: 0, summary: "Could not parse response. Visit birdeye.com to look up this loan officer directly.", highlights: [], concerns: [], sources: [], _failed: true };
+    const data = await resp.json();
+    if (data.error) return { rating: 0, reviewCount: 0, summary: "API error: " + (data.error.message || JSON.stringify(data.error)).slice(0, 150), highlights: [], concerns: [], sources: [], _failed: true };
+    const text = (data.content?.map(b => b.text || "").join("") || "").replace(/```json|```/g, "").trim();
+    if (!text) return { rating: 0, reviewCount: 0, summary: "Empty response from AI. Try again.", highlights: [], concerns: [], sources: [], _failed: true };
+    try {
+      const result = JSON.parse(text);
+      if (result.reviewCount > 0) result.summary = (result.summary || "") + " (Training data — visit birdeye.com for current reviews)";
+      return result;
+    } catch {
+      // Try to extract JSON from mixed text
+      const m = text.match(/\{[\s\S]*?"rating"[\s\S]*?\}/);
+      if (m) { try { const r = JSON.parse(m[0]); if (r.reviewCount > 0) r.summary = (r.summary || "") + " (Training data)"; return r; } catch {} }
+      return { rating: 0, reviewCount: 0, summary: "Got response but couldn't parse it. Response started with: " + text.slice(0, 80), highlights: [], concerns: [], sources: [], _failed: true };
+    }
   } catch (e) {
-    return { rating: 0, reviewCount: 0, summary: "Connection error: " + (e.message || "Unknown"), highlights: [], concerns: [], sources: [], _failed: true };
+    return { rating: 0, reviewCount: 0, summary: "Network error: " + (e.message || "Unknown"), highlights: [], concerns: [], sources: [], _failed: true };
   }
 }
 
@@ -349,6 +336,8 @@ export default function MortgageCompare() {
   const [reps, setReps] = useState({});
   const [repLoading, setRepLoading] = useState({});
   const [showBreakevenInfo, setShowBreakevenInfo] = useState(false);
+  const [extraPayment, setExtraPayment] = useState(0);
+  const [showExtraPay, setShowExtraPay] = useState(false);
   const alerts = detectAlerts(quotes);
   const handleQuoteChange = useCallback((i, data) => {
     setQuotes(prev => {
@@ -683,18 +672,24 @@ export default function MortgageCompare() {
               </div>}
               <div className="resp-flex" style={{ display: "flex", gap: 10, marginBottom: 20 }}>
                 {analysis.map(a => {
-                  if (!baseline || a.rate === baseRate) return <div key={a.i} style={{ flex: 1, padding: 16, background: T.warmGray, borderRadius: 14, textAlign: "center" }}><div style={{ fontSize: 15, fontWeight: 600, color: a.color.bg }}>{a.rate}%</div><div style={{ fontSize: 11, color: T.textLight }}>Baseline</div></div>;
+                  if (!baseline || a.rate === baseRate) return <div key={a.i} style={{ flex: 1, padding: 16, background: T.warmGray, borderRadius: 14, textAlign: "center", borderTop: `4px solid ${a.color.bg}` }}><div style={{ fontSize: 12, fontWeight: 700, color: a.color.bg, marginBottom: 2 }}>{a.name}</div><div style={{ fontSize: 18, fontWeight: 600, color: a.color.bg }}>{a.rate}%</div><div style={{ fontSize: 11, color: T.textLight }}>Baseline (highest rate)</div></div>;
                   const sav = baseline.pi - a.pi, extra = a.lc - baseline.lc;
                   const mo = sav > 0 && extra > 0 ? Math.ceil(extra / sav) : null;
-                  return <div key={a.i} style={{ flex: 1, padding: 16, background: T.warmGray, borderRadius: 14, textAlign: "center" }}>
-                    <div style={{ fontSize: 15, fontWeight: 600, color: a.color.bg }}>{a.rate}%</div>
-                    {mo ? <><div style={{ fontSize: 11, color: T.textLight }}>Save {fmt2(sav)}/mo · {fmt(extra)} extra</div><div style={{ fontSize: 24, fontWeight: 700, fontFamily: "var(--mono)", color: mo <= horizon * 12 ? T.success : T.danger, marginTop: 6 }}>{(mo / 12).toFixed(1)} yrs</div><div style={{ fontSize: 10, color: mo <= horizon * 12 ? T.success : T.danger, fontWeight: 600 }}>{mo <= horizon * 12 ? "✓ Recovers in time" : "✗ Doesn't recover"}</div></> : <div style={{ fontSize: 11, color: T.textLight }}>Higher cost & payment</div>}
+                  return <div key={a.i} style={{ flex: 1, padding: 16, background: T.warmGray, borderRadius: 14, textAlign: "center", borderTop: `4px solid ${a.color.bg}` }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: a.color.bg, marginBottom: 2 }}>{a.name}</div>
+                    <div style={{ fontSize: 18, fontWeight: 600, color: a.color.bg }}>{a.rate}%</div>
+                    {mo ? <><div style={{ fontSize: 11, color: T.textLight, marginTop: 4 }}>Save {fmt2(sav)}/mo · {fmt(extra)} extra upfront</div><div style={{ fontSize: 24, fontWeight: 700, fontFamily: "var(--mono)", color: mo <= horizon * 12 ? T.success : T.danger, marginTop: 6 }}>{(mo / 12).toFixed(1)} yrs</div><div style={{ fontSize: 10, color: mo <= horizon * 12 ? T.success : T.danger, fontWeight: 600 }}>{mo <= horizon * 12 ? "✓ Recovers in time" : "✗ Doesn't recover"}</div></> : <div style={{ fontSize: 11, color: T.textLight, marginTop: 4 }}>Higher cost & payment</div>}
                   </div>;
                 })}
               </div>
               <div style={{ overflowX: "auto" }}>
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-                <thead><tr style={{ borderBottom: `2px solid ${T.border}` }}><th style={{ textAlign: "left", padding: 10, fontSize: 10, textTransform: "uppercase", color: T.textLight, letterSpacing: "0.06em" }}>Horizon</th>{analysis.map(a => <th key={a.i} style={{ textAlign: "right", padding: 10, fontSize: 10, color: a.color.bg, letterSpacing: "0.06em" }}>{a.rate}%</th>)}</tr></thead>
+                <thead>
+                  <tr style={{ borderBottom: `2px solid ${T.border}` }}>
+                    <th style={{ textAlign: "left", padding: 10, fontSize: 10, textTransform: "uppercase", color: T.textLight, letterSpacing: "0.06em" }}>Horizon</th>
+                    {analysis.map(a => <th key={a.i} style={{ textAlign: "right", padding: "10px 10px 4px", fontSize: 11, color: a.color.bg, fontWeight: 700, fontFamily: "var(--heading)", borderBottom: `3px solid ${a.color.bg}` }}>{a.name}<br/><span style={{ fontSize: 10, fontWeight: 400, fontFamily: "var(--mono)" }}>{a.rate}%</span></th>)}
+                  </tr>
+                </thead>
                 <tbody>{[3, 5, 7, 10, 15].map(yr => { const costs = analysis.map(a => a.lc + a.pi * yr * 12); const mn = Math.min(...costs); return <tr key={yr} style={{ borderBottom: `1px solid ${T.warmGray}`, background: yr === horizon ? T.goldPale : "transparent", fontWeight: yr === horizon ? 700 : 400 }}><td style={{ padding: 10 }}>{yr} yr{yr === horizon ? " ←" : ""}</td>{costs.map((c, j) => <td key={j} style={{ textAlign: "right", padding: 10, fontFamily: "var(--mono)", color: c === mn ? T.success : T.text, fontWeight: c === mn ? 700 : 400 }}>{fmt(c)}{c === mn ? " ✓" : ""}</td>)}</tr>; })}</tbody>
               </table>
               </div>
@@ -711,6 +706,61 @@ export default function MortgageCompare() {
                 lines.push(`Over your ${horizon}-year horizon, ${best.name} at ${best.rate}% delivers the best value at ${fmt(best.tc)} total cost.`);
                 return lines.map((l, i) => <p key={i} style={{ margin: "0 0 10px" }}>{l}</p>);
               })()}
+            </div>
+
+            {/* Extra Payment Calculator */}
+            <div className="fade-up glass-card" style={{ animationDelay: "0.35s", borderRadius: 24, padding: "32px 36px", marginBottom: 24 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 }}>
+                <div style={{ fontSize: 26, fontFamily: "var(--heading)", color: T.green }}>What If I Pay Extra?</div>
+                <button onClick={() => setShowExtraPay(p => !p)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${T.border}`, background: T.cream, cursor: "pointer", fontSize: 11, color: T.textMid, fontWeight: 600 }}>{showExtraPay ? "Hide ▲" : "Explore ▼"}</button>
+              </div>
+              {!showExtraPay && <div style={{ fontSize: 14, color: T.textLight }}>See how extra monthly payments could shorten your loan and save on interest.</div>}
+              {showExtraPay && <div>
+                <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 20, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 13, color: T.textMid, fontWeight: 600 }}>Extra per month:</span>
+                  {[0, 100, 200, 500, 1000].map(v => <button key={v} onClick={() => setExtraPayment(v)} style={{ padding: "8px 16px", borderRadius: 10, border: extraPayment === v ? `2px solid ${T.green}` : `1px solid ${T.border}`, background: extraPayment === v ? T.greenPale : T.white, cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "var(--mono)", color: extraPayment === v ? T.green : T.text }}>{v === 0 ? "None" : `+$${v}`}</button>)}
+                  <input type="number" value={extraPayment || ""} onChange={e => setExtraPayment(parseInt(e.target.value) || 0)} placeholder="Custom" style={{ width: 90, padding: "8px 12px", borderRadius: 10, border: `1px solid ${T.border}`, fontSize: 13, fontFamily: "var(--mono)", outline: "none" }} />
+                </div>
+                <div className="resp-grid-2" style={{ display: "grid", gridTemplateColumns: `repeat(${analysis.length}, 1fr)`, gap: 12 }}>
+                  {analysis.map(a => {
+                    const la = a.la, rate = a.rate / 100 / 12, origTerm = (quotes.find(q => q.lenderName === a.name)?.term || 30) * 12;
+                    const origTotal = a.pi * origTerm;
+                    let bal = la, months = 0, totalPaid = 0;
+                    const payment = a.pi + extraPayment;
+                    while (bal > 0.01 && months < origTerm) {
+                      const interest = bal * rate;
+                      const principal = Math.min(payment - interest, bal);
+                      if (principal <= 0) break;
+                      bal -= principal; totalPaid += payment; months++;
+                    }
+                    const saved = origTotal - totalPaid;
+                    const yearsOff = ((origTerm - months) / 12);
+                    return <div key={a.i} style={{ padding: 16, background: T.warmGray, borderRadius: 14, textAlign: "center", borderTop: `4px solid ${a.color.bg}` }}>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: a.color.bg, fontFamily: "var(--heading)" }}>{a.name}</div>
+                      <div style={{ fontSize: 11, color: T.textLight }}>{a.rate}% · {fmt2(a.pi)}/mo</div>
+                      {extraPayment > 0 ? <>
+                        <div style={{ marginTop: 10, fontSize: 10, color: T.textLight, textTransform: "uppercase", letterSpacing: "0.06em" }}>New payoff</div>
+                        <div style={{ fontSize: 22, fontFamily: "var(--mono)", fontWeight: 700, color: T.green }}>{(months / 12).toFixed(1)} yrs</div>
+                        <div style={{ fontSize: 11, color: T.success, fontWeight: 600 }}>{yearsOff.toFixed(1)} years sooner</div>
+                        <div style={{ fontSize: 11, color: T.textMid, marginTop: 4 }}>Save {fmt(Math.max(0, saved))} in interest</div>
+                      </> : <div style={{ fontSize: 12, color: T.textLight, marginTop: 10 }}>Select an amount above</div>}
+                    </div>;
+                  })}
+                </div>
+              </div>}
+            </div>
+
+            {/* Email / Share */}
+            <div className="fade-up" style={{ animationDelay: "0.4s", textAlign: "center", marginBottom: 24 }}>
+              <button onClick={() => {
+                const subj = encodeURIComponent(`MortgageCompare: ${analysis.map(a => a.name + " " + a.rate + "%").join(" vs ")}`);
+                const lines = [`MortgageCompare Report — ${horizon}-Year Horizon`, `Generated ${new Date().toLocaleDateString()}`, "", "BEST VALUE: " + best.name + " at " + best.rate + "%", ""];
+                analysis.forEach(a => { lines.push(`── ${a.name} (${a.rate}%) ──`); lines.push(`  P&I: ${fmt2(a.pi)}/mo`); lines.push(`  Lender Fees: ${fmt(a.lf)}`); lines.push(`  Points/Origination: ${fmt(a.pts)}`); lines.push(`  Lender-Controlled Total: ${fmt(a.lc)}`); lines.push(`  Total Cost (${horizon}yr): ${fmt(a.tc)}`); lines.push(""); });
+                lines.push("COST OVER TIME");
+                [3,5,7,10,15].forEach(yr => { const row = analysis.map(a => `${a.name}: ${fmt(a.lc + a.pi * yr * 12)}`).join(" | "); lines.push(`  ${yr}yr${yr===horizon?" ←":""}: ${row}`); });
+                lines.push("", "— Generated by MortgageCompare. Estimates only.");
+                window.location.href = `mailto:?subject=${subj}&body=${encodeURIComponent(lines.join("\n"))}`;
+              }} style={{ padding: "14px 32px", borderRadius: 14, border: `1px solid ${T.border}`, background: T.white, cursor: "pointer", fontSize: 14, fontWeight: 600, color: T.green, boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}>✉️ Email This Comparison</button>
             </div>
           </div>
         )}
