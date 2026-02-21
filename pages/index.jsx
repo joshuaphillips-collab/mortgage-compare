@@ -225,7 +225,40 @@ function AIChat({ analysis, horizon }) {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const endRef = useRef();
-  const ctx = `You are a mortgage comparison advisor. 4-bucket framework: Bucket 1=Lender Fees (processing+UW), Bucket 4=Points & Origination (minus lender credits), Bucket 2=Third-Party, Bucket 3=Escrows.\nCREDIT RULES: Seller credits excluded. Lender credits subtract from points/origination. Earnest money excluded. Unknown credits treated as seller.\nHorizon: ${horizon}yr.\n${analysis.map(a => `${a.name} (${a.rate}%) Officer:${a.officer||"?"} P&I:${fmt2(a.pi)}/mo LenderFees:${fmt(a.lf)} Points:${fmt(a.pts)} Lender-Ctrl:${fmt(a.lc)} Cash:${a.cash > 0 ? fmt(a.cash) : "N/A"} Total${horizon}yr:${fmt(a.tc)}`).join("\n")}\nBe warm and specific with dollar amounts. 2-3 paragraphs max.`;
+  const ctx = `You are a mortgage comparison advisor helping a real consumer choose between loan estimates. You have access to EXACT calculated data below. CRITICAL RULES:
+1. NEVER estimate or approximate — use ONLY the exact numbers provided below.
+2. When asked about P&I (principal & interest), use the EXACT monthly payment shown for each quote.
+3. When comparing costs over time, use the EXACT total cost formula: Lender-Controlled Total + (Monthly P&I × months).
+4. Always reference quotes by lender name, not "Quote 1" etc.
+5. Be warm, clear, and specific. Use dollar amounts. 2-3 paragraphs max.
+
+TIME HORIZON: ${horizon} years (${months} months)
+
+=== EXACT QUOTE DATA (use these numbers, do NOT calculate your own) ===
+${analysis.map(a => {
+    const costByYear = [3,5,7,10,15].map(yr => `  ${yr}-year total: ${fmt(a.lc + a.pi * yr * 12)}`).join("\n");
+    return `QUOTE: ${a.name}
+  Loan Officer: ${a.officer || "Not specified"}
+  Program: ${a.program}
+  Loan Amount: ${fmt(a.la)}
+  Interest Rate: ${a.rate}%
+  Monthly P&I Payment: ${fmt2(a.pi)} (this is EXACT — do not recalculate)
+  Lender Fees (Bucket 1): ${fmt(a.lf)}
+  Points/Origination (Bucket 4): ${fmt(a.pts)}
+  Lender-Controlled Total: ${fmt(a.lc)}
+  Cash to Close: ${a.cash > 0 ? fmt(a.cash) : "Not provided"}
+  Total Cost at ${horizon} years: ${fmt(a.tc)} (this is EXACT — do not recalculate)
+  Cost by time horizon:
+${costByYear}`;
+  }).join("\n\n")}
+
+=== COMPARISON FRAMEWORK ===
+- "Lender-Controlled" = fees the lender actually controls (their fees + points/origination minus any lender credits)
+- Third-party fees (title, appraisal) and escrows are similar across lenders and excluded from the comparison
+- Seller credits are noted but excluded — they're not a lender cost
+- The BEST VALUE at ${horizon} years is: ${best ? best.name + " at " + fmt(best.tc) : "N/A"}
+
+If the user asks which is best over X years, calculate: Lender-Controlled Total + (Monthly P&I × X × 12). Use the EXACT P&I values above.`;
   const send = async () => {
     if (!input.trim() || loading) return;
     const msg = input.trim(); setInput("");
@@ -379,12 +412,16 @@ export default function MortgageCompare() {
   const baseline = analysis.find(a => a.rate === baseRate);
   const handleLookupRep = async (officer, lender) => {
     const key = `${officer}|${lender}`;
-    if (repLoading[key]) return; // already in progress
+    if (repLoading[key]) return;
     setRepLoading(prev => ({ ...prev, [key]: true }));
-    // Clear any previous failed result so retry works
     setReps(prev => { const n = { ...prev }; delete n[key]; return n; });
     try {
-      const r = await lookupReputation(officer, lender);
+      let r = await lookupReputation(officer, lender);
+      // Auto-retry once if first attempt failed
+      if (r._failed) {
+        await new Promise(ok => setTimeout(ok, 1500));
+        r = await lookupReputation(officer, lender);
+      }
       setReps(prev => ({ ...prev, [key]: r }));
     } catch (e) {
       setReps(prev => ({ ...prev, [key]: { rating: 0, reviewCount: 0, summary: "Search failed. Please try again.", highlights: [], concerns: [], sources: [], _failed: true } }));
