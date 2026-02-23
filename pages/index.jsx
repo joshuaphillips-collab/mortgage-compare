@@ -109,7 +109,16 @@ CLASSIFICATION:
 - Processing/Underwriting/Admin→lender fees. Discount Points/Loan Discount→discountPoints (BORROWER pays to reduce rate, NOT a credit). Loan Origination 1%→loanOriginationFee.
 - "Seller Credit"/"SellerCredit"/"Other Credits" in summary→sellerCredit. "Lender Credit"/"Lender Paid"→lenderCredit. "Earnest Money"→earnestMoney. Unclear credits→unknownCredit.
 - "Loan Credit 1/2" at $0→ignore. "Loan Discount/Credits/Adjustments"→discountPoints (this is points, not a credit).
-- Rate: number only. "Cash TO/FROM Borrower"→cashToClose.`;
+- Rate: number only. "Cash TO/FROM Borrower"→cashToClose.
+
+CRITICAL — CREDITS RULES (read carefully):
+- "Total Credits" is a SUMMARY LINE that adds up loan amount + all credits. It is NOT a lender credit. NEVER extract "Total Credits" as lenderCredit or sellerCredit or any credit field.
+- "Other: LenderCredit" with $ or $0 or blank = NO lender credit (set to "").
+- "Non-Borrower Paid Closing Costs" or "Total Non-Borrower Paid" = sellerCredit.
+- "BorrowerPaidFees" = NOT a credit. It is fees the borrower pays. Do not put it in any credit field.
+- If any single credit value exceeds the loan amount, it is almost certainly a summary total — set it to "".
+- "Verification of Employment Fee" → otherLenderFees.
+- Homeowner's Insurance annual amount: look for the monthly amount × 12 OR the lump sum in prepaids.`;
 
 async function extractFromDocument(file) {
   const base64 = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result.split(",")[1]); r.onerror = rej; r.readAsDataURL(file); });
@@ -119,14 +128,20 @@ async function extractFromDocument(file) {
   if (!resp.ok) throw new Error("API request failed (" + resp.status + ")");
   const data = await resp.json();
   const text = (data.content?.map(b => b.text || "").join("") || "").replace(/```json|```/g, "").trim();
-  return JSON.parse(text);
+  const result = JSON.parse(text);
+  // Post-extraction validation: catch impossible credit values
+  const la = num(result.loanAmount) || num(result.purchasePrice) || 999999;
+  ["sellerCredit", "lenderCredit", "unknownCredit"].forEach(field => {
+    if (num(result[field]) > la * 0.5) result[field] = ""; // credit > 50% of loan = almost certainly a misread
+  });
+  return result;
 }
 
-// ─── Reputation Lookup — web search enabled ───
+// ─── Reputation Lookup — Sonnet 4.5 with web search ───
 async function lookupReputation(officer, lender) {
   const shortLender = lender.replace(/ Corporation$/i, "").replace(/ Company$/i, "").replace(/ Inc\.?$/i, "");
   const sys = `Search the web for loan officer reviews then return ONLY valid JSON. Search for: "${officer} ${shortLender} reviews", "${officer} ${lender} reviews", and "${officer} loan officer birdeye". Birdeye.com usually has the most reviews. Also check Google, Zillow, Yelp, and the lender website. Return: {"rating":4.9,"reviewCount":671,"summary":"2-3 sentences","highlights":["theme1","theme2"],"concerns":[],"sources":["Birdeye (671 reviews)","Google (15 reviews)"]}. If not found: {"rating":0,"reviewCount":0,"summary":"No reviews found.","highlights":[],"concerns":[],"sources":[]}`;
-  const msg = `Search for reviews of loan officer ${officer} at ${lender} (also known as ${shortLender}). Find their Birdeye profile, Google reviews, and any other review platforms. Report the total reviews and rating.`;
+  const msg = `Search for reviews of loan officer ${officer} at ${lender} (also known as ${shortLender}). Find their Birdeye profile, Google reviews, and any other review platforms.`;
   try {
     const res = await fetch(API, { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: "claude-sonnet-4-5-20250929", max_tokens: 2000, system: sys,
@@ -134,20 +149,20 @@ async function lookupReputation(officer, lender) {
         tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }]
       }) });
     if (!res.ok) {
-      const errBody = await res.text().catch(() => "no body");
-      return { rating: 0, reviewCount: 0, summary: `API returned HTTP ${res.status}. Detail: ${errBody.slice(0, 200)}`, highlights: [], concerns: [], sources: [], _failed: true };
+      const errBody = await res.text().catch(() => "");
+      return { rating: 0, reviewCount: 0, summary: `HTTP ${res.status}: ${errBody.slice(0, 150)}`, highlights: [], concerns: [], sources: [], _failed: true };
     }
     const data = await res.json();
-    if (data.error) return { rating: 0, reviewCount: 0, summary: "API error: " + JSON.stringify(data.error).slice(0, 200), highlights: [], concerns: [], sources: [], _failed: true };
+    if (data.error) return { rating: 0, reviewCount: 0, summary: "API error: " + JSON.stringify(data.error).slice(0, 150), highlights: [], concerns: [], sources: [], _failed: true };
     const text = (data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "").replace(/```json|```/g, "").trim();
-    if (!text) return { rating: 0, reviewCount: 0, summary: "Search ran but returned no text. Content types: " + (data.content?.map(b => b.type).join(", ") || "none"), highlights: [], concerns: [], sources: [], _failed: true };
+    if (!text) return { rating: 0, reviewCount: 0, summary: "No text in response. Types: " + (data.content?.map(b => b.type).join(", ") || "none"), highlights: [], concerns: [], sources: [], _failed: true };
     try { return JSON.parse(text); } catch {
       const m = text.match(/\{[\s\S]*?"rating"[\s\S]*?\}/);
       if (m) { try { return JSON.parse(m[0]); } catch {} }
-      return { rating: 0, reviewCount: 0, summary: "Parse failed. Raw text: " + text.slice(0, 150), highlights: [], concerns: [], sources: [], _failed: true };
+      return { rating: 0, reviewCount: 0, summary: "Parse failed: " + text.slice(0, 100), highlights: [], concerns: [], sources: [], _failed: true };
     }
   } catch (e) {
-    return { rating: 0, reviewCount: 0, summary: "Network error: " + (e.message || "Unknown"), highlights: [], concerns: [], sources: [], _failed: true };
+    return { rating: 0, reviewCount: 0, summary: "Error: " + (e.message || "Unknown"), highlights: [], concerns: [], sources: [], _failed: true };
   }
 }
 
@@ -225,42 +240,20 @@ function AIChat({ analysis, horizon }) {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const endRef = useRef();
-  const months = horizon * 12;
-  const best = analysis.length ? analysis.reduce((a, b) => (a.tc < b.tc ? a : b)) : null;
-  const ctx = `You are a mortgage comparison advisor helping a real consumer choose between loan estimates. You have access to EXACT calculated data below. CRITICAL RULES:
-1. NEVER estimate or approximate — use ONLY the exact numbers provided below.
-2. When asked about P&I (principal & interest), use the EXACT monthly payment shown for each quote.
-3. When comparing costs over time, use the EXACT total cost formula: Lender-Controlled Total + (Monthly P&I × months).
-4. Always reference quotes by lender name, not "Quote 1" etc.
-5. Be warm, clear, and specific. Use dollar amounts. 2-3 paragraphs max.
+  const mo = horizon * 12;
+  const cheapest = analysis.length ? analysis.reduce((a, b) => a.tc < b.tc ? a : b) : null;
+  const quoteData = analysis.map(a =>
+    `${a.name} | Rate: ${a.rate}% | Monthly P&I: ${fmt2(a.pi)} | Lender Fees: ${fmt(a.lf)} | Points: ${fmt(a.pts)} | Lender-Controlled: ${fmt(a.lc)} | Cash to Close: ${a.cash > 0 ? fmt(a.cash) : "N/A"} | Loan Amount: ${fmt(a.la)} | ${horizon}yr Total: ${fmt(a.tc)}` +
+    ` | 3yr: ${fmt(a.lc + a.pi*36)} | 5yr: ${fmt(a.lc + a.pi*60)} | 7yr: ${fmt(a.lc + a.pi*84)} | 10yr: ${fmt(a.lc + a.pi*120)}`
+  ).join("\n");
+  const ctx = `You are a mortgage advisor. Use ONLY the EXACT numbers below. NEVER estimate or recalculate — these are pre-computed.
 
-TIME HORIZON: ${horizon} years (${months} months)
+QUOTES (${horizon}-year horizon):
+${quoteData}
 
-=== EXACT QUOTE DATA (use these numbers, do NOT calculate your own) ===
-${analysis.map(a => {
-    const costByYear = [3,5,7,10,15].map(yr => `  ${yr}-year total: ${fmt(a.lc + a.pi * yr * 12)}`).join("\n");
-    return `QUOTE: ${a.name}
-  Loan Officer: ${a.officer || "Not specified"}
-  Program: ${a.program}
-  Loan Amount: ${fmt(a.la)}
-  Interest Rate: ${a.rate}%
-  Monthly P&I Payment: ${fmt2(a.pi)} (this is EXACT — do not recalculate)
-  Lender Fees (Bucket 1): ${fmt(a.lf)}
-  Points/Origination (Bucket 4): ${fmt(a.pts)}
-  Lender-Controlled Total: ${fmt(a.lc)}
-  Cash to Close: ${a.cash > 0 ? fmt(a.cash) : "Not provided"}
-  Total Cost at ${horizon} years: ${fmt(a.tc)} (this is EXACT — do not recalculate)
-  Cost by time horizon:
-${costByYear}`;
-  }).join("\n\n")}
+Best value at ${horizon}yr: ${cheapest ? cheapest.name + " at " + fmt(cheapest.tc) : "N/A"}
 
-=== COMPARISON FRAMEWORK ===
-- "Lender-Controlled" = fees the lender actually controls (their fees + points/origination minus any lender credits)
-- Third-party fees (title, appraisal) and escrows are similar across lenders and excluded from the comparison
-- Seller credits are noted but excluded — they're not a lender cost
-- The BEST VALUE at ${horizon} years is: ${best ? best.name + " at " + fmt(best.tc) : "N/A"}
-
-If the user asks which is best over X years, calculate: Lender-Controlled Total + (Monthly P&I × X × 12). Use the EXACT P&I values above.`;
+Rules: "Lender-Controlled" = lender fees + points (what the lender controls). Seller credits excluded. Be specific with dollar amounts. 2-3 paragraphs max.`;
   const send = async () => {
     if (!input.trim() || loading) return;
     const msg = input.trim(); setInput("");
@@ -419,11 +412,7 @@ export default function MortgageCompare() {
     setReps(prev => { const n = { ...prev }; delete n[key]; return n; });
     try {
       let r = await lookupReputation(officer, lender);
-      // Auto-retry once if first attempt failed
-      if (r._failed) {
-        await new Promise(ok => setTimeout(ok, 1500));
-        r = await lookupReputation(officer, lender);
-      }
+      if (r._failed) { await new Promise(ok => setTimeout(ok, 1500)); r = await lookupReputation(officer, lender); }
       setReps(prev => ({ ...prev, [key]: r }));
     } catch (e) {
       setReps(prev => ({ ...prev, [key]: { rating: 0, reviewCount: 0, summary: "Search failed. Please try again.", highlights: [], concerns: [], sources: [], _failed: true } }));
