@@ -225,6 +225,8 @@ function AIChat({ analysis, horizon }) {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const endRef = useRef();
+  const months = horizon * 12;
+  const best = analysis.length ? analysis.reduce((a, b) => (a.tc < b.tc ? a : b)) : null;
   const ctx = `You are a mortgage comparison advisor helping a real consumer choose between loan estimates. You have access to EXACT calculated data below. CRITICAL RULES:
 1. NEVER estimate or approximate — use ONLY the exact numbers provided below.
 2. When asked about P&I (principal & interest), use the EXACT monthly payment shown for each quote.
